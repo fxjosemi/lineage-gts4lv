@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Compila LineageOS 22.2 (Android 15) + microG para gts4lv con toda nuestra
+# Compila LineageOS 22.2 (Android 15) para gts4lv con toda nuestra
 # configuracion: DAP por dispositivo, audio_effects, parches de kernel,
-# Jelly fuera y Firefox por defecto.
+# Jelly fuera, Firefox y Aurora Store. Sin microG: las GApps de Google se
+# flashean aparte (MindTheGapps 15.0.0-arm64) despues de la ROM.
 #
 #   bash scripts/build-a15.sh              # prepara + build completa (zip)
 #   bash scripts/build-a15.sh bootimage    # solo boot.img
 #   SKIP_PREP=1 bash scripts/build-a15.sh  # saltar prepare-a15/add-firefox
+#   WITH_GMS=true bash scripts/build-a15.sh  # volver a microG (no mezclar)
 #
 # Log: ~/build22-live.log (nativo) + espejo en out/build22-live.log (VS Code)
 set -eo pipefail
@@ -33,7 +35,10 @@ export LC_ALL=C
 export USE_CCACHE=1
 export CCACHE_EXEC="$(command -v ccache)"
 export CCACHE_DIR="${CCACHE_DIR:-${HOME}/.ccache}"
-export WITH_GMS=true
+# sin microG: la ROM va limpia y las GApps (MindTheGapps) se flashean despues.
+# Con WITH_GMS=true vuelve microG; ojo, no se pueden mezclar y cambiar la
+# variable recompila medio arbol.
+export WITH_GMS="${WITH_GMS:-false}"
 export LINEAGE_BUILD=gts4lv
 
 # Ojo con la RAM: el analisis de Soong (soong_build) pide ~27 GB residentes y 36

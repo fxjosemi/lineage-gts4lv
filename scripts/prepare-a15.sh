@@ -104,6 +104,17 @@ else
     echo "Firefox: parche no aplica limpio (revisar gts4lv.mk)"
 fi
 echo "descarga el APK con: bash scripts/add-firefox.sh $SRC"
+
+P="$WS/patches/devicetree-22/0006-aurora-store-en-producto.patch"
+if git -C "$SRC/device/samsung/gts4lv-common" apply --check "$P" 2>/dev/null; then
+    git -C "$SRC/device/samsung/gts4lv-common" apply "$P"
+    echo "Aurora Store y Aurora Services anadidos al producto"
+elif git -C "$SRC/device/samsung/gts4lv-common" apply --reverse --check "$P" 2>/dev/null; then
+    echo "Aurora Store ya estaba en el producto"
+else
+    echo "Aurora: parche no aplica limpio (revisar gts4lv.mk)"
+fi
+echo "descarga los APK con: bash scripts/add-aurorastore.sh $SRC"
 echo "blobs de audio: python3 scripts/port-audio-blobs.py $SRC"
 
 cat <<'FIN'

@@ -14,6 +14,17 @@ y scripts que van en otros repos.
 - `docs/`: notas de la migración y del audio.
 - `scripts/`: sincronizar, compilar, Firefox, blobs de audio y sideload.
 
+## microG y GApps
+
+La ROM se compila **sin microG**. Las GApps de Google se flashean aparte, en el
+recovery, justo después del zip:
+
+```sh
+adb sideload MindTheGapps-15.0.0-arm64-<fecha>.zip
+```
+
+Para volver a microG: `WITH_GMS=true bash scripts/build-a15.sh` (no mezclar las dos).
+
 ## Audio
 
 La curva del altavoz la hace un efecto propio (`hardware/samsung/dap/eq`), sin

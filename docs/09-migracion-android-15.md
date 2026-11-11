@@ -1,4 +1,4 @@
-# Migracion a Android 15 (LineageOS 22.2)
+﻿# Migracion a Android 15 (LineageOS 22.2)
 
 Preparado el 2026-11-08. Recoge todo lo que hay que llevarse de la build de
 Android 13 (LineageOS 20) y como, sin depender de memoria.
@@ -129,7 +129,7 @@ breakfast gts4lv
 mka bacon -j8
 ```
 
-⚠️ Cambio de version: recovery 22.2 + *Format data* + sideload (borra datos).
+âš ï¸ Cambio de version: recovery 22.2 + *Format data* + sideload (borra datos).
 Volver a A13 es flashear su recovery/zip (tambien borra datos).
 
 ## 4.7 Trampas que costaron una build (Android 15)
@@ -138,17 +138,17 @@ Todas resueltas; sirven de aviso si algo cambia:
 
 | Sintoma | Causa | Arreglo |
 |---|---|---|
-| `unresolved reference: R` / `RadioButtonPreference` en `SamsungDAP` | SettingsLib cambió de paquete en A15 | `SelectorWithWidgetPreference` + `com.android.settingslib.collapsingtoolbar.R`, y `static_libs` `SettingsLibCollapsingToolbarBaseActivity` / `SettingsLibSelectorWithWidgetPreference` |
+| `unresolved reference: R` / `RadioButtonPreference` en `SamsungDAP` | SettingsLib cambiÃ³ de paquete en A15 | `SelectorWithWidgetPreference` + `com.android.settingslib.collapsingtoolbar.R`, y `static_libs` `SettingsLibCollapsingToolbarBaseActivity` / `SettingsLibSelectorWithWidgetPreference` |
 | `found ELF prebuilt in PRODUCT_COPY_FILES` | un `.so` copiado con `PRODUCT_COPY_FILES` | declararlo como `cc_prebuilt_library_shared` + `PRODUCT_PACKAGES` (lo hace `port-audio-blobs.py`) |
-| `packaging conflict at lib64/...` | el `fsgen` de A15 promociona `vendor/lib` a `lib64` | no copiar la variante de 32 bits si ya está la de 64 |
-| `DT_NEEDED "libX" is not specified in shared_libs` | blobs de Samsung con dependencias que no existen como módulo | `check_elf_files: false` en esos módulos |
+| `packaging conflict at lib64/...` | el `fsgen` de A15 promociona `vendor/lib` a `lib64` | no copiar la variante de 32 bits si ya estÃ¡ la de 64 |
+| `DT_NEEDED "libX" is not specified in shared_libs` | blobs de Samsung con dependencias que no existen como mÃ³dulo | `check_elf_files: false` en esos mÃ³dulos |
 | `missing dependencies: libHMT` | igual que arriba, y `shared_libs` declaradas | dejar los prebuilts **sin** `shared_libs` |
 | `invalid file` / `zip END header not found` en `webview.apk` | el repo usa Git LFS y el sync no lo trajo | `git -C external/chromium-webview/prebuilt/arm64 lfs pull` (en los 4 arch) |
 | `metalava ... Could not find package com.android.ims...` | restos corruptos de un intento anterior | `rm -rf out/soong/.temp/sbox out/soong/.intermediates/frameworks/base/api/test-api-stubs-docs-non-updatable` |
-| Soong muere con un `panic` raro | algún repo quedó a medias en el sync | `git -C <repo> reset && git -C <repo> checkout -- .` |
-| `Killed` (OOM) en `soong_build` | el análisis pide ~27 GB residentes / 36 virtuales | `.wslconfig`: `memory=24GB`, `processors=12`, `swap=16GB` (con 28 GB el host se queda sin memoria) |
+| Soong muere con un `panic` raro | algÃºn repo quedÃ³ a medias en el sync | `git -C <repo> reset && git -C <repo> checkout -- .` |
+| `Killed` (OOM) en `soong_build` | el anÃ¡lisis pide ~27 GB residentes / 36 virtuales | `.wslconfig`: `memory=24GB`, `processors=12`, `swap=16GB` (con 28 GB el host se queda sin memoria) |
 
-## 4.8 Audio: de dónde salen los blobs
+## 4.8 Audio: de dÃ³nde salen los blobs
 
 TheMuppets 22.2 trae solo 6 libs en `vendor/lib/soundfx`; faltan las de verdad
 (`libaudiosaplus_sec`, `libmysound`, `libmyspace`,
@@ -164,7 +164,7 @@ python3 scripts/port-audio-blobs.py ~/android/lineage-22 /tmp/dump
 ```
 
 El script los declara con `soc_specific: true`, `relative_install_path:
-"soundfx"` y `check_elf_files: false`, y añade el `android_arm64` al módulo
+"soundfx"` y `check_elf_files: false`, y aÃ±ade el `android_arm64` al mÃ³dulo
 `libsecaudioinfo` (que upstream define solo para 32 bits).
 
 ## 5. Lo que hay que revisar a mano en el device tree 22.2
@@ -193,8 +193,8 @@ decidir si siguen haciendo falta:
   `lib_SoundAlive_play_plus_ver400`, `lib_SoundAlive_AlbumArt_ver105`,
   `lib_SoundBooster_ver900`, `lib_SoundAlive_SRC384_ver320`...) se copian del
   dispositivo (o de un dump stock) con
-  `scripts/port-audio-blobs.py <arbol-22.2> <origen>`, que además los declara
-  como módulos y añade su bloque a `PRODUCT_PACKAGES`. Ver §4.8.
+  `scripts/port-audio-blobs.py <arbol-22.2> <origen>`, que ademÃ¡s los declara
+  como mÃ³dulos y aÃ±ade su bloque a `PRODUCT_PACKAGES`. Ver Â§4.8.
 
 ## 7. Estado real a 10/11/2026 (A15 ya instalado)
 
@@ -205,7 +205,7 @@ La tablet corre **22.2-20261110-UNOFFICIAL-gts4lv** (Android 15, userdebug) con:
   `SamsungDAP` instalado.
 - Kernel con `CONFIG_HZ=300`, `CONFIG_CPU_BOOST`, `CONFIG_RCU_BOOST`.
 
-⚠️ **Pendiente**: el `Firefox.apk` del zip instalado no valida (falla por
+âš ï¸ **Pendiente**: el `Firefox.apk` del zip instalado no valida (falla por
 `resources.arsc` comprimido; targetSdk >= 30 lo exige STORED y alineado). En la
 tablet ya esta corregido a mano (`/system/app/Firefox/Firefox.apk`), pero **el zip
 de `out/lineage-22-a15/` sigue con el APK viejo**, asi que un reflasheo dejaria la
@@ -217,7 +217,7 @@ scripts/build-a15.sh`) para regenerar el zip.
 Pendiente tambien comprobar en la tablet:
 - `zram` **ya usa lz4**: en `/sys/block/zram0/comp_algorithm` la salida es
   `lzo [lz4] deflate lz4hc` y los corchetes marcan el **activo**, asi que el
-  parche `0004` funciona. Ratio medido en `mm_stat`: 86,9 MB → 18,8 MB (4,6:1).
+  parche `0004` funciona. Ratio medido en `mm_stat`: 86,9 MB â†’ 18,8 MB (4,6:1).
 
 ### Estado de RAM medido (11/11/2026, sin recompilar nada)
 
@@ -232,9 +232,9 @@ Pendiente tambien comprobar en la tablet:
 | Kills del LMK | **0** | nunca ha matado nada |
 
 Conclusion: no hay nada que afinar en RAM/zram (ni swappiness, ni
-`vfs_cache_pressure`, ni tamaño de zram): el sistema no pasa penuria, y lo que
+`vfs_cache_pressure`, ni tamaÃ±o de zram): el sistema no pasa penuria, y lo que
 limita es CPU/GPU, igual que salio en `docs/04-benchmarks.md`. Lo unico que se
-come la memoria es Firefox (2 pestañas ≈ 760 MB entre 4 procesos).
+come la memoria es Firefox (2 pestaÃ±as â‰ˆ 760 MB entre 4 procesos).
 
 Verificado que **no** hace falta: el `recovery.img` de 22.2 si se flasheo. Se
 comprueba sin reiniciar comparando el arranque de la particion con el fichero:
@@ -268,7 +268,7 @@ libgearvr.so:                   libHMT.so                           not found
 ```
 
 Con 11 elementos del config descartados, cualquier `AudioEffect` con esos UUIDs
-devolvia `-2` (NAME_NOT_FOUND) — y tambien los de AOSP (`equalizer`, `downmix`,
+devolvia `-2` (NAME_NOT_FOUND) â€” y tambien los de AOSP (`equalizer`, `downmix`,
 `bassboost`...), porque sus librerias tampoco estaban en 32 bits.
 
 **Arreglo**: las dependencias **de 32 bits** (venian del vendor de A13) van a
@@ -338,7 +338,7 @@ sin la app nueva, asi que hay que regenerarlo antes de volver a flashear.
 - Audio por altavoz con la curva stock y los perfiles.
 - Cascos/BT: **sin** efecto de SoundAlive (panel en `Solo altavoz`), Dolby
   opcional.
-- A2DP con los Nothing: conexion estable y audio enroutado (esto es lo que motivó
+- A2DP con los Nothing: conexion estable y audio enroutado (esto es lo que motivÃ³
   el salto).
 - Navegador: solo Firefox instalado (sin Jelly ni `Browser2`) y los enlaces
   abren en Firefox.
@@ -480,4 +480,95 @@ Comprobacion en la tablet tras flashear:
 ```
 adb shell cat /proc/sys/net/ipv4/tcp_congestion_control   # bbr
 adb shell cat /sys/block/sda/queue/scheduler              # el que use el UFS
+```
+
+
+## 13. microG fuera, GApps de Google (11/11, madrugada)
+
+### 13.1 Que paso con microG
+
+microG no es un parche: son paquetes que solo entran si el producto lo pide. La
+cadena es `vendor/lineage/config/partner_gms.mk`, que empieza con
+`ifeq ($(WITH_GMS),true)` y, si se cumple, hereda
+`vendor/partner_gms/products/gms.mk` (`GmsCore`, `FakeStore`, `GsfProxy`,
+`FDroid`, `FDroidPrivilegedExtension`, `additional_repos.*`).
+
+Consecuencia: **`m bacon` a mano, sin `WITH_GMS`, compila una ROM sin microG**, y
+no avisa de nada. El 10/11 paso exactamente eso:
+
+| build | como | microG |
+|---|---|---|
+| 12:19 | `scripts/build-a15.sh` (`WITH_GMS=true`) | si (`adding: SYSTEM/product/priv-app/GmsCore/GmsCore.apk`) |
+| 23:42 | `m bacon` suelto para probar el audio | **no** |
+
+`getprop ro.build.date` en la tablet daba `Tue Nov 10 23:42:03`, o sea la segunda.
+Al flashear, un APK de sistema que ya no existe se borra **con sus datos**: hubo
+que volver a iniciar sesion en microG.
+
+### 13.2 Decision: ROM limpia + MindTheGapps
+
+Se deja de compilar microG. `scripts/build-a15.sh` exporta
+`WITH_GMS="${WITH_GMS:-false}"`, asi que la ROM sale limpia y las GApps se
+flashean aparte, que es lo que hace todo el mundo con LineageOS:
+
+```sh
+adb sideload lineage-22.2-<fecha>-UNOFFICIAL-gts4lv.zip
+adb sideload MindTheGapps-15.0.0-arm64-<fecha>.zip    # en recovery, justo despues
+```
+
+- MindTheGapps 15.0.0-arm64 se baja de su GitHub
+  (`MindTheGapps/15.0.0-arm64`); el espejo `download.mirrorservice.com` esta
+  muerto (403 / dominio en venta), asi que `tools/get-gapps.sh` usa la API de
+  GitHub y comprueba el `sha256`.
+- El zip trae 22 APK en `system/product` y `system/system_ext` (GmsCore,
+  Phonesky, Velvet, GSF, SetupWizard, overlays) mas sus `privapp-permissions`,
+  `sysconfig` y un `addon.d`, asi que **sobreviven a las actualizaciones** de la
+  ROM.
+- No se puede mezclar: microG y GApps usan el mismo nombre de paquete
+  (`com.google.android.gms`) con firmas distintas. Al flashear una ROM sin microG,
+  PackageManager borra el paquete y sus datos, y las GApps entran limpias.
+- Volver a microG es `WITH_GMS=true bash scripts/build-a15.sh`, pero eso
+  recompila medio arbol (cambia la configuracion del producto).
+
+### 13.3 Aurora Store como app de sistema
+
+`scripts/add-aurorastore.sh` deja dos prebuilts en
+`device/samsung/gts4lv-common/prebuilt/` y el parche
+`0006-aurora-store-en-producto.patch` los mete en `PRODUCT_PACKAGES` (con guarda
+`ifneq ($(wildcard ...),)`, igual que Firefox).
+
+- `AuroraStore` (4.8.4): `android_app_import` con `presigned: true`,
+  `privileged: true` y `dex_preopt` desactivado (targetSdk 37). Ademas un
+  `default-permissions` con notificaciones y almacenamiento.
+- `AuroraServices` (1.1.1): el backend que instala y desinstala sin dialogos.
+  Es el unico que declara permisos privilegiados, y son exactamente dos:
+
+  ```
+  android.permission.INSTALL_PACKAGES   [signature|privileged]
+  android.permission.DELETE_PACKAGES    [signature|privileged|role]
+  ```
+
+  `Aurora Store` **no** declara ninguno (comprobado con `aapt2 dump permissions`
+  contra el `AndroidManifest.xml` del framework). Por eso hacerla priv-app no le
+  da instalar sola: el instalador se elige en
+  **Ajustes -> Instalacion -> Metodo de instalacion**, y ahi hay que marcar
+  *Servicios de Aurora* (por defecto esta *Instalador de sesion*, que pide
+  confirmacion en cada APK).
+
+Ojo con `ro.control_privapp_permissions=enforce`, que es como viene esta ROM: la
+whitelist tiene que estar **completa** o el paquete no arranca. Por eso la de
+Services se genero desde el manifiesto y no a ojo.
+
+Los APK no se guardan en el repositorio. Si las descargas fallan, el script
+acepta el APK ya descargado:
+
+```sh
+AURORA_STORE_APK=~/Descargas/AuroraStore-4.8.4.apk bash scripts/add-aurorastore.sh
+```
+
+Comprobacion en la tablet:
+```
+adb shell pm list packages | grep -iE "gms|vending|aurora|fdroid"
+adb shell dumpsys package com.aurora.services | grep -E "codePath|INSTALL_PACKAGES"
+adb shell dumpsys package com.aurora.store    | grep -E "codePath|flags="
 ```
