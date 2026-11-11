@@ -1,0 +1,15 @@
+android_app_import {
+    name: "Firefox",
+    apk: "Firefox.apk",
+    presigned: true,
+    // targetSdk >= 30 va firmado con v2; si el build lo reprocesa se carga la
+    // firma, asi que se instala tal cual (sin dexpreopt).
+    preprocessed: true,
+    // Firefox declara estas tres como uses-library-not-required en su manifiesto;
+    // si no se listan aqui, manifest_check aborta la build.
+    optional_uses_libs: [
+        "android.car",
+        "androidx.window.extensions",
+        "androidx.window.sidecar",
+    ],
+}

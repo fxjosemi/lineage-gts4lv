@@ -1,0 +1,37 @@
+From 41655fca5b72e7c733329877b4f656cdc8338f65 Mon Sep 17 00:00:00 2001
+From: xjosemi <xjosemi@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 02:12:54 +0100
+Subject: [PATCH] zram: compresor lz4 por defecto
+
+Este kernel 4.9 no tiene CONFIG_ZRAM_DEF_COMP_*, y comp_algorithm solo se
+puede escribir con el dispositivo sin disksize (si no, el kernel ignora la
+escritura sin dar error). Intentarlo desde init.target.rc con un script no
+funcionaba: init no puede ejecutar /system/bin/sh desde su dominio SELinux.
+Se cambia el valor por defecto del driver, que es donde se copia a
+zram->compressor antes de que fs_mgr escriba disksize.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Change-Id: I278d9dc85acb056df5ea04e26e9b4bafc7c58d38
+---
+ drivers/block/zram/zram_drv.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index d11775a04..f8df1d319 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -40,7 +40,10 @@ static DEFINE_IDR(zram_index_idr);
+ static DEFINE_MUTEX(zram_index_mutex);
+ 
+ static int zram_major;
+-static const char *default_compressor = "lzo";
++/* gts4lv: lz4 por defecto. Este kernel (4.9) no tiene CONFIG_ZRAM_DEF_COMP_*,
++ * y comp_algorithm solo se puede cambiar con el dispositivo sin disksize,
++ * asi que el sitio correcto es el valor por defecto. */
++static const char *default_compressor = "lz4";
+ 
+ /* Module params (documentation at end) */
+ static unsigned int num_devices = 1;
+-- 
+2.49.0
+

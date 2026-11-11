@@ -1,0 +1,12 @@
+--- a/config/common.mk
++++ b/config/common.mk
+@@ -129,8 +129,7 @@
+ # Lineage packages
+ ifeq ($(PRODUCT_IS_ATV),)
+ PRODUCT_PACKAGES += \
+-    ExactCalculator \
+-    Jelly
++    ExactCalculator
+ endif
+ 
+ ifeq ($(PRODUCT_IS_AUTOMOTIVE),)

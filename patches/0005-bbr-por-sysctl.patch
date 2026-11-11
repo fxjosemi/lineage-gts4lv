@@ -1,0 +1,30 @@
+diff --git a/init/init.target.rc b/init/init.target.rc
+index abbcc82..afc51d6 100755
+--- a/init/init.target.rc
++++ b/init/init.target.rc
+@@ -138,6 +138,11 @@ on post-fs-data
+ on early-boot
+     start irsc_util
+ 
++on boot
++    # BBR como congestion TCP por defecto. El kernel lo trae compilado pero el
++    # Kconfig deja "cubic" como predeterminado, asi que se fija aqui.
++    write /proc/sys/net/ipv4/tcp_congestion_control bbr
++
+ on boot
+     # chown system system /sys/kernel/hbtp/display_pwr
+     start rmt_storage
+@@ -427,3 +432,13 @@ service vendor.contexthub-hal-1-0 /vendor/bin/hw/android.hardware.contexthub@1.0
+     user system
+     group system
+     disabled
++
++# gts4lv: afinado medido en la tablet (el jank venia del hilo de UI, no de la RAM)
++on property:sys.boot_completed=1
++    # boost de las tareas en primer plano
++    write /dev/stune/top-app/schedtune.boost 20
++    write /dev/stune/top-app/schedtune.prefer_idle 1
++    # GPU: que no baje de frecuencia entre frames
++    write /sys/class/kgsl/kgsl-3d0/idle_timer 100
++    # eMMC: lectura por adelantado en la particion de datos
++    write /sys/block/mmcblk0/queue/read_ahead_kb 128

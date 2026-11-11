@@ -1,0 +1,3513 @@
+diff --git a/dap/Android.bp b/dap/Android.bp
+index 56e9e0b..c643bf3 100644
+--- a/dap/Android.bp
++++ b/dap/Android.bp
+@@ -20,6 +20,10 @@ android_app {
+     srcs: ["src/**/*.kt"],
+     certificate: "platform",
+     platform_apis: true,
+-    static_libs: ["androidx.preference_preference"],
++    static_libs: [
++        "androidx.preference_preference",
++        "SettingsLibCollapsingToolbarBaseActivity",
++        "SettingsLibSelectorWithWidgetPreference",
++    ],
+     system_ext_specific: true,
+ }
+diff --git a/dap/AndroidManifest.xml b/dap/AndroidManifest.xml
+index 821b599..3053f77 100644
+--- a/dap/AndroidManifest.xml
++++ b/dap/AndroidManifest.xml
+@@ -2,7 +2,7 @@
+ <!--
+      Copyright (C) 2022 The LineageOS Project
+ 
+-     Licensed under the Apache License, Version 2.0 (the "License"
++     Licensed under the Apache License, Version 2.0 (the "License");
+      you may not use this file except in compliance with the License.
+      You may obtain a copy of the License at
+ 
+@@ -20,9 +20,11 @@
+     android:versionCode="1"
+     android:versionName="1.0">
+ 
++    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+ 
+     <application
++        android:name=".DapApplication"
+         android:defaultToDeviceProtectedStorage="true"
+         android:directBootAware="true"
+         android:label="SamsungDAP"
+@@ -64,6 +66,17 @@
+             </intent-filter>
+         </receiver>
+ 
++        <!-- Se queda con el intent de sesion de audio que reenvia AudioService. -->
++        <receiver
++            android:name=".EffectSessionReceiver"
++            android:exported="true">
++            <intent-filter android:priority="1000">
++                <action android:name="android.media.action.OPEN_AUDIO_EFFECT_CONTROL_SESSION" />
++                <action android:name="android.media.action.CLOSE_AUDIO_EFFECT_CONTROL_SESSION" />
++                <category android:name="android.intent.category.DEFAULT" />
++            </intent-filter>
++        </receiver>
++
+         <service
+             android:name=".DolbyTile"
+             android:exported="true"
+diff --git a/dap/eq/Android.bp b/dap/eq/Android.bp
+new file mode 100755
+index 0000000..28aa0e6
+--- /dev/null
++++ b/dap/eq/Android.bp
+@@ -0,0 +1,25 @@
++// Efecto de ecualizacion del altavoz, sin dependencias de Samsung.
++// El HAL de efectos es de 32 bits, asi que se instala en las dos variantes.
++cc_library_shared {
++    name: "libdapeq",
++    stem: "libdapeq",
++    vendor: true,
++    relative_install_path: "soundfx",
++    compile_multilib: "both",
++    srcs: [
++        "dapeq.cpp",
++    ],
++    header_libs: [
++        "libhardware_headers",
++        "libaudio_system_headers",
++    ],
++    shared_libs: [
++        "liblog",
++    ],
++    cflags: [
++        "-Wall",
++        "-Werror",
++        "-Wno-unused-parameter",
++        "-fvisibility=hidden",
++    ],
++}
+\ No newline at end of file
+diff --git a/dap/eq/dapeq.cpp b/dap/eq/dapeq.cpp
+new file mode 100755
+index 0000000..02a56d8
+--- /dev/null
++++ b/dap/eq/dapeq.cpp
+@@ -0,0 +1,468 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#define LOG_TAG "DapEq"
++
++#include <complex>
++#include <errno.h>
++#include <math.h>
++#include <new>
++#include <stdlib.h>
++#include <string.h>
++
++#include <hardware/audio_effect.h>
++#include <log/log.h>
++#include <system/audio.h>
++
++namespace {
++
++constexpr int kBands = 9;
++
++// Bandas del motor de la stock: 63/125/250/500/1k/2k/4k/8k/16k Hz.
++constexpr float kBandHz[kBands] = {63.f, 125.f, 250.f, 500.f, 1000.f,
++                                   2000.f, 4000.f, 8000.f, 16000.f};
++
++// La curva del altavoz de la stock, en dB. Es todo lo que haciamos con su motor.
++constexpr float kBaseDb[kBands] = {1.f, 4.f, 3.f, -6.f, 1.f, -3.f, -12.f, -2.f, 4.f};
++
++constexpr float kQ = 1.4f;
++constexpr float kMinDb = -12.f;
++constexpr float kMaxDb = 12.f;
++constexpr float kDefaultPregainDb = -4.f;
++
++// Parametros propios (dB con dos decimales se manda como int32 en centesimas).
++constexpr int32_t kParamBypass = 1;
++constexpr int32_t kParamPregain = 2;
++constexpr int32_t kParamBandFirst = 10;
++constexpr int32_t kParamCurve = 20;
++
++constexpr int kMaxChannels = 2;
++
++// d1e0a001-7c00-4b00-9f00-000000000001
++constexpr effect_uuid_t kUuid = {
++        0xd1e0a001, 0x7c00, 0x4b00, 0x9f00, {0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
++
++inline float clampf(float v, float lo, float hi) {
++    return v < lo ? lo : (v > hi ? hi : v);
++}
++
++inline float softClip(float x) {
++    constexpr float t = 0.80f;
++    if (x > t) return t + (1.f - t) * tanhf((x - t) / (1.f - t));
++    if (x < -t) return -t - (1.f - t) * tanhf((-x - t) / (1.f - t));
++    return x;
++}
++
++struct DapEqContext {
++    const effect_interface_s *itfe = nullptr;
++    effect_config_t config = {};
++    bool initialized = false;
++    bool configured = false;
++    bool enabled = false;
++    bool bypass = false;
++
++    float pregainDb = kDefaultPregainDb;
++    float gainDb[kBands] = {0};
++
++    // Coeficientes normalizados por a0.
++    float b0[kBands] = {0}, b1[kBands] = {0}, b2[kBands] = {0};
++    float a1[kBands] = {0}, a2[kBands] = {0};
++    float z1[kBands][kMaxChannels] = {};
++    float z2[kBands][kMaxChannels] = {};
++
++    float pregain = 1.f;
++    uint32_t sampleRate = 48000;
++    int channels = kMaxChannels;
++};
++
++int32_t DapEqLib_Create(const effect_uuid_t *uuid, int32_t sessionId, int32_t ioId,
++                        effect_handle_t *pHandle);
++int32_t DapEqLib_Release(effect_handle_t handle);
++int32_t DapEqLib_GetDescriptor(const effect_uuid_t *uuid, effect_descriptor_t *pDescriptor);
++
++int32_t DapEq_Process(effect_handle_t self, audio_buffer_t *inBuffer, audio_buffer_t *outBuffer);
++int32_t DapEq_Command(effect_handle_t self, uint32_t cmdCode, uint32_t cmdSize, void *pCmdData,
++                      uint32_t *replySize, void *pReplyData);
++int32_t DapEq_GetDescriptor(effect_handle_t self, effect_descriptor_t *pDescriptor);
++
++const effect_interface_s gDapEqInterface = {
++        DapEq_Process,
++        DapEq_Command,
++        DapEq_GetDescriptor,
++        nullptr,
++};
++
++}  // namespace
++
++// El simbolo AELI tiene que estar enlazado externamente: dentro de un namespace
++// anonimo queda con linkage interno y EffectsFactory no lo encuentra.
++__attribute__((visibility("default"))) audio_effect_library_t AUDIO_EFFECT_LIBRARY_INFO_SYM = {
++        .tag = AUDIO_EFFECT_LIBRARY_TAG,
++        .version = EFFECT_LIBRARY_API_VERSION,
++        .name = "Speaker EQ Library",
++        .implementor = "The LineageOS Project",
++        .create_effect = DapEqLib_Create,
++        .release_effect = DapEqLib_Release,
++        .get_descriptor = DapEqLib_GetDescriptor,
++};
++
++namespace {
++
++const effect_descriptor_t gDapEqDescriptor = {
++        kUuid,  // type
++        kUuid,  // uuid
++        EFFECT_CONTROL_API_VERSION,
++        // INSERT_FIRST fija la posicion en la cadena: nuestra curva va
++        // siempre antes de Dolby. Con INSERT_LAST el orden dependia de quien
++        // se creara antes y el sonido alternaba entre dos cadenas.
++        EFFECT_FLAG_TYPE_INSERT | EFFECT_FLAG_INSERT_FIRST,
++        0,
++        0,
++        "Speaker EQ",
++        "The LineageOS Project",
++};
++
++void resetState(DapEqContext *ctx) {
++    memset(ctx->z1, 0, sizeof(ctx->z1));
++    memset(ctx->z2, 0, sizeof(ctx->z2));
++}
++
++/**
++ * Coeficientes de las 9 bandas para unos ajustes dados (RBJ peaking).
++ */
++void rawCoefficients(DapEqContext *ctx, const float *gainDb, float fs) {
++    for (int i = 0; i < kBands; i++) {
++        const float gain = clampf(gainDb[i], -15.f, 15.f);
++        // Por encima de Nyquist no se puede filtrar: se deja pasar.
++        if (kBandHz[i] >= fs * 0.45f || gain == 0.f) {
++            ctx->b0[i] = 1.f;
++            ctx->b1[i] = 0.f;
++            ctx->b2[i] = 0.f;
++            ctx->a1[i] = 0.f;
++            ctx->a2[i] = 0.f;
++            continue;
++        }
++        const float A = powf(10.f, gain / 40.f);
++        const float w0 = 2.f * (float)M_PI * kBandHz[i] / fs;
++        const float alpha = sinf(w0) / (2.f * kQ);
++        const float cosw0 = cosf(w0);
++        const float a0 = 1.f + alpha / A;
++
++        ctx->b0[i] = (1.f + alpha * A) / a0;
++        ctx->b1[i] = (-2.f * cosw0) / a0;
++        ctx->b2[i] = (1.f - alpha * A) / a0;
++        ctx->a1[i] = (-2.f * cosw0) / a0;
++        ctx->a2[i] = (1.f - alpha / A) / a0;
++    }
++}
++
++/** Respuesta en dB de una banda a una frecuencia dada. */
++float bandResponseDb(const DapEqContext *ctx, int band, float f) {
++    const float w = 2.f * (float)M_PI * f / (float)ctx->sampleRate;
++    const std::complex<float> z1(cosf(-w), sinf(-w));
++    const std::complex<float> z2 = z1 * z1;
++    const std::complex<float> num = ctx->b0[band] + ctx->b1[band] * z1 + ctx->b2[band] * z2;
++    const std::complex<float> den = 1.f + ctx->a1[band] * z1 + ctx->a2[band] * z2;
++    return 20.f * log10f(std::abs(num) / std::abs(den));
++}
++
++/**
++ * Las bandas estan a una octava y se solapan, asi que la respuesta real es la
++ * SUMA de las 9. Si se pone +4 dB en 125 Hz tal cual, en 125 Hz se miden +4,5 y
++ * en los medios se cuela parte del corte del vecino (a 2 kHz salian -5,5 en vez
++ * de -3): el balance se iba a graves. Aqui se resuelven los puntos de ajuste
++ * para que en el centro de cada banda se mida exactamente lo pedido.
++ */
++void computeCoefficients(DapEqContext *ctx) {
++    const float fs = ctx->sampleRate > 0 ? (float)ctx->sampleRate : 48000.f;
++    float target[kBands];
++    float setpoint[kBands];
++    for (int i = 0; i < kBands; i++) {
++        target[i] = clampf(ctx->gainDb[i], kMinDb, kMaxDb);
++        setpoint[i] = target[i];
++    }
++    for (int it = 0; it < 4; it++) {
++        rawCoefficients(ctx, setpoint, fs);
++        for (int i = 0; i < kBands; i++) {
++            float realized = 0.f;
++            for (int j = 0; j < kBands; j++) {
++                realized += bandResponseDb(ctx, j, kBandHz[i]);
++            }
++            setpoint[i] = clampf(setpoint[i] + target[i] - realized, -15.f, 15.f);
++        }
++    }
++    rawCoefficients(ctx, setpoint, fs);
++
++    ctx->pregain = powf(10.f, clampf(ctx->pregainDb, -24.f, 0.f) / 20.f);
++    ALOGV("coeficientes a %u Hz, pregain %.2f dB", ctx->sampleRate, ctx->pregainDb);
++}
++
++void applyCurveDefaults(DapEqContext *ctx) {
++    for (int i = 0; i < kBands; i++) ctx->gainDb[i] = kBaseDb[i];
++}
++
++int configure(DapEqContext *ctx, const effect_config_t *config) {
++    if (config->inputCfg.samplingRate == 0 || config->inputCfg.channels == 0) {
++        return -EINVAL;
++    }
++    ctx->config = *config;
++    ctx->sampleRate = config->inputCfg.samplingRate;
++
++    const int channels = __builtin_popcount(config->inputCfg.channels);
++    ctx->channels = channels > kMaxChannels ? kMaxChannels : (channels < 1 ? 1 : channels);
++
++    ctx->configured = true;
++    resetState(ctx);
++    computeCoefficients(ctx);
++    return 0;
++}
++
++void passthrough(const audio_buffer_t *in, audio_buffer_t *out, size_t frames,
++                 audio_format_t format, int channels) {
++    size_t bytes = 0;
++    if (format == AUDIO_FORMAT_PCM_FLOAT) {
++        bytes = sizeof(float);
++    } else if (format == AUDIO_FORMAT_PCM_16_BIT) {
++        bytes = sizeof(int16_t);
++    } else {
++        return;
++    }
++    if (in->raw == out->raw) return;
++    memcpy(out->raw, in->raw, frames * (size_t)channels * bytes);
++}
++
++void processFloat(DapEqContext *ctx, const float *src, float *dst, size_t frames, bool accumulate) {
++    const int ch = ctx->channels;
++    for (size_t f = 0; f < frames; f++) {
++        for (int c = 0; c < ch; c++) {
++            const size_t idx = f * ch + c;
++            float x = src[idx] * ctx->pregain;
++            for (int b = 0; b < kBands; b++) {
++                const float y = ctx->b0[b] * x + ctx->z1[b][c];
++                ctx->z1[b][c] = ctx->b1[b] * x - ctx->a1[b] * y + ctx->z2[b][c];
++                ctx->z2[b][c] = ctx->b2[b] * x - ctx->a2[b] * y;
++                x = y;
++            }
++            const float out = softClip(x);
++            dst[idx] = accumulate ? dst[idx] + out : out;
++        }
++    }
++}
++
++int32_t setParameter(DapEqContext *ctx, int32_t param, uint32_t size, void *value) {
++    if (param == kParamBypass) {
++        if (size != sizeof(int32_t)) return -EINVAL;
++        ctx->bypass = *(int32_t *)value != 0;
++        resetState(ctx);
++        return 0;
++    }
++    if (param == kParamPregain) {
++        if (size != sizeof(int32_t)) return -EINVAL;
++        ctx->pregainDb = *(int32_t *)value / 100.f;
++        computeCoefficients(ctx);
++        return 0;
++    }
++    if (param >= kParamBandFirst && param < kParamBandFirst + kBands) {
++        if (size != sizeof(int32_t)) return -EINVAL;
++        ctx->gainDb[param - kParamBandFirst] = *(int32_t *)value / 100.f;
++        computeCoefficients(ctx);
++        return 0;
++    }
++    if (param == kParamCurve) {
++        if (size != kBands * sizeof(int32_t)) return -EINVAL;
++        const int32_t *curve = (const int32_t *)value;
++        for (int i = 0; i < kBands; i++) ctx->gainDb[i] = curve[i] / 100.f;
++        computeCoefficients(ctx);
++        return 0;
++    }
++    ALOGE("setParameter: parametro %d desconocido", param);
++    return -EINVAL;
++}
++
++int32_t getParameter(DapEqContext *ctx, int32_t param, uint32_t *size, void *value) {
++    if (param == kParamBypass) {
++        if (*size < sizeof(int32_t)) return -EINVAL;
++        *(int32_t *)value = ctx->bypass ? 1 : 0;
++        *size = sizeof(int32_t);
++        return 0;
++    }
++    if (param == kParamPregain) {
++        if (*size < sizeof(int32_t)) return -EINVAL;
++        *(int32_t *)value = (int32_t)(ctx->pregainDb * 100.f);
++        *size = sizeof(int32_t);
++        return 0;
++    }
++    if (param >= kParamBandFirst && param < kParamBandFirst + kBands) {
++        if (*size < sizeof(int32_t)) return -EINVAL;
++        *(int32_t *)value = (int32_t)(ctx->gainDb[param - kParamBandFirst] * 100.f);
++        *size = sizeof(int32_t);
++        return 0;
++    }
++    if (param == kParamCurve) {
++        if (*size < kBands * sizeof(int32_t)) return -EINVAL;
++        int32_t *curve = (int32_t *)value;
++        for (int i = 0; i < kBands; i++) curve[i] = (int32_t)(ctx->gainDb[i] * 100.f);
++        *size = kBands * sizeof(int32_t);
++        return 0;
++    }
++    return -EINVAL;
++}
++
++int32_t DapEqLib_Create(const effect_uuid_t *uuid, int32_t sessionId, int32_t ioId,
++                        effect_handle_t *pHandle) {
++    if (pHandle == nullptr) return -EINVAL;
++    if (uuid != nullptr && memcmp(uuid, &kUuid, sizeof(effect_uuid_t)) != 0) return -ENOENT;
++
++    DapEqContext *ctx = new (std::nothrow) DapEqContext();
++    if (ctx == nullptr) return -ENOMEM;
++
++    ctx->itfe = &gDapEqInterface;
++    // La curva del altavoz va siempre puesta: no depende de que la app la pida.
++    applyCurveDefaults(ctx);
++    computeCoefficients(ctx);
++
++    *pHandle = (effect_handle_t)ctx;
++    ALOGI("creado (session %d, io %d)", sessionId, ioId);
++    return 0;
++}
++
++int32_t DapEqLib_Release(effect_handle_t handle) {
++    if (handle == nullptr) return -EINVAL;
++    delete (DapEqContext *)handle;
++    return 0;
++}
++
++int32_t DapEqLib_GetDescriptor(const effect_uuid_t *uuid, effect_descriptor_t *pDescriptor) {
++    if (pDescriptor == nullptr) return -EINVAL;
++    if (uuid != nullptr && memcmp(uuid, &kUuid, sizeof(effect_uuid_t)) != 0) return -ENOENT;
++    *pDescriptor = gDapEqDescriptor;
++    return 0;
++}
++
++int32_t DapEq_GetDescriptor(effect_handle_t self, effect_descriptor_t *pDescriptor) {
++    if (self == nullptr || pDescriptor == nullptr) return -EINVAL;
++    *pDescriptor = gDapEqDescriptor;
++    return 0;
++}
++
++int32_t DapEq_Process(effect_handle_t self, audio_buffer_t *inBuffer, audio_buffer_t *outBuffer) {
++    DapEqContext *ctx = (DapEqContext *)self;
++    if (ctx == nullptr || !ctx->initialized) return -EINVAL;
++    if (inBuffer == nullptr || inBuffer->raw == nullptr || outBuffer == nullptr ||
++        outBuffer->raw == nullptr) {
++        return -EINVAL;
++    }
++    const size_t frames = inBuffer->frameCount;
++    if (frames == 0) return 0;
++
++    const audio_format_t format = (audio_format_t)ctx->config.inputCfg.format;
++    const int channels = __builtin_popcount(ctx->config.inputCfg.channels);
++    const bool processable = ctx->enabled && !ctx->bypass && ctx->configured &&
++            format == AUDIO_FORMAT_PCM_FLOAT && channels <= kMaxChannels;
++
++    // Todo lo que no se procesa se copia tal cual: devolver -EINVAL haria que
++    // AudioFlinger considerase el efecto roto y lo soltase de la cadena.
++    if (!processable) {
++        passthrough(inBuffer, outBuffer, frames, format, channels);
++        return 0;
++    }
++
++    const bool accumulate = ctx->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE;
++    processFloat(ctx, inBuffer->f32, outBuffer->f32, frames, accumulate);
++    return 0;
++}
++
++int32_t DapEq_Command(effect_handle_t self, uint32_t cmdCode, uint32_t cmdSize, void *pCmdData,
++                      uint32_t *replySize, void *pReplyData) {
++    DapEqContext *ctx = (DapEqContext *)self;
++    if (ctx == nullptr) return -EINVAL;
++
++    switch (cmdCode) {
++        case EFFECT_CMD_INIT:
++            if (pReplyData == nullptr || replySize == nullptr || *replySize != sizeof(int32_t)) {
++                return -EINVAL;
++            }
++            ctx->initialized = true;
++            *(int32_t *)pReplyData = 0;
++            return 0;
++
++        case EFFECT_CMD_SET_CONFIG:
++            if (pCmdData == nullptr || cmdSize != sizeof(effect_config_t) ||
++                pReplyData == nullptr || replySize == nullptr ||
++                *replySize != sizeof(int32_t)) {
++                return -EINVAL;
++            }
++            *(int32_t *)pReplyData = configure(ctx, (const effect_config_t *)pCmdData);
++            return 0;
++
++        case EFFECT_CMD_GET_CONFIG:
++            if (pReplyData == nullptr || replySize == nullptr ||
++                *replySize != sizeof(effect_config_t)) {
++                return -EINVAL;
++            }
++            *(effect_config_t *)pReplyData = ctx->config;
++            return 0;
++
++        case EFFECT_CMD_RESET:
++            resetState(ctx);
++            return 0;
++
++        case EFFECT_CMD_ENABLE:
++            if (pReplyData == nullptr || replySize == nullptr || *replySize != sizeof(int32_t)) {
++                return -EINVAL;
++            }
++            resetState(ctx);
++            ctx->enabled = true;
++            *(int32_t *)pReplyData = 0;
++            return 0;
++
++        case EFFECT_CMD_DISABLE:
++            if (pReplyData == nullptr || replySize == nullptr || *replySize != sizeof(int32_t)) {
++                return -EINVAL;
++            }
++            ctx->enabled = false;
++            resetState(ctx);
++            *(int32_t *)pReplyData = 0;
++            return 0;
++
++        case EFFECT_CMD_SET_PARAM: {
++            if (pCmdData == nullptr || cmdSize < sizeof(effect_param_t) + sizeof(int32_t) ||
++                pReplyData == nullptr || replySize == nullptr ||
++                *replySize != sizeof(int32_t)) {
++                return -EINVAL;
++            }
++            effect_param_t *cmd = (effect_param_t *)pCmdData;
++            if (cmd->psize != sizeof(int32_t)) return -EINVAL;
++            *(int32_t *)pReplyData =
++                    setParameter(ctx, *(int32_t *)cmd->data, cmd->vsize, cmd->data + sizeof(int32_t));
++            return 0;
++        }
++
++        case EFFECT_CMD_GET_PARAM: {
++            if (pCmdData == nullptr || cmdSize < sizeof(effect_param_t) + sizeof(int32_t) ||
++                pReplyData == nullptr || replySize == nullptr ||
++                *replySize < sizeof(effect_param_t) + 2 * sizeof(int32_t)) {
++                return -EINVAL;
++            }
++            effect_param_t *rep = (effect_param_t *)pReplyData;
++            memcpy(pReplyData, pCmdData, sizeof(effect_param_t) + sizeof(int32_t));
++            rep->status = getParameter(ctx, *(int32_t *)rep->data, &rep->vsize,
++                                       rep->data + sizeof(int32_t));
++            *replySize = sizeof(effect_param_t) + sizeof(int32_t) + rep->vsize;
++            return 0;
++        }
++
++        case EFFECT_CMD_SET_DEVICE:
++        case EFFECT_CMD_SET_VOLUME:
++        case EFFECT_CMD_SET_AUDIO_MODE:
++            return 0;
++
++        default:
++            ALOGV("comando %u no soportado", cmdCode);
++            return -EINVAL;
++    }
++}
++
++}  // namespace
+\ No newline at end of file
+diff --git a/dap/res/layout/preference_equalizer.xml b/dap/res/layout/preference_equalizer.xml
+new file mode 100755
+index 0000000..5032e20
+--- /dev/null
++++ b/dap/res/layout/preference_equalizer.xml
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical"
++    android:paddingStart="12dp"
++    android:paddingEnd="12dp"
++    android:paddingTop="8dp"
++    android:paddingBottom="8dp">
++
++    <org.lineageos.dap.EqualizerView
++        android:id="@+id/eq_view"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content" />
++
++</LinearLayout>
+\ No newline at end of file
+diff --git a/dap/res/values-ast-rES/strings.xml b/dap/res/values-ast-rES/strings.xml
+index 83a51a0..045e125 100644
+--- a/dap/res/values-ast-rES/strings.xml
++++ b/dap/res/values-ast-rES/strings.xml
+@@ -1,12 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Activar Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Esperimenta un audiu innovador pa la reproducción multimedia que flúi alredor de ti</string>
+-    <string name="dolby_profile_game">Xuegu</string>
+-    <string name="dolby_profile_game_1">Xuegu 1</string>
+-    <string name="dolby_profile_game_2">Xuegu 2</string>
+-    <string name="dolby_profile_movie">Filme</string>
+-    <string name="dolby_profile_music">Música</string>
+-    <string name="dolby_profile_spacial_audio">Audiu espacial</string>
+-    <string name="dolby_profile_voice">Voz</string>
+ </resources>
+diff --git a/dap/res/values-az/strings.xml b/dap/res/values-az/strings.xml
+index 7459f80..045e125 100644
+--- a/dap/res/values-az/strings.xml
++++ b/dap/res/values-az/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Dolby Atmos-u fəallaşdır</string>
+-    <string name="dolby_top_intro_summary">Üzərinizdə və ətrafınızdan axan medianın oxudulması üçün inqilabi səsi sınaqdan keçirin</string>
+-    <string name="dolby_profile_auto">Avto</string>
+-    <string name="dolby_profile_game">Oyun</string>
+-    <string name="dolby_profile_game_1">Oyun 1</string>
+-    <string name="dolby_profile_game_2">Oyun 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Musiqi</string>
+-    <string name="dolby_profile_off">Profil yoxdur</string>
+-    <string name="dolby_profile_spacial_audio">Xüsusi səs</string>
+-    <string name="dolby_profile_voice">Səs</string>
+ </resources>
+diff --git a/dap/res/values-be/strings.xml b/dap/res/values-be/strings.xml
+index 8101bf1..045e125 100644
+--- a/dap/res/values-be/strings.xml
++++ b/dap/res/values-be/strings.xml
+@@ -1,4 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_profile_off">Няма профілю</string>
+ </resources>
+diff --git a/dap/res/values-ca/strings.xml b/dap/res/values-ca/strings.xml
+index 0e1d5ac..045e125 100644
+--- a/dap/res/values-ca/strings.xml
++++ b/dap/res/values-ca/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Activa Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experimenteu un àudio innovador per a la reproducció multimèdia que flueix per sobre i al vostre voltant</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Joc</string>
+-    <string name="dolby_profile_game_1">Joc 1</string>
+-    <string name="dolby_profile_game_2">Joc 2</string>
+-    <string name="dolby_profile_movie">Pel·lícula</string>
+-    <string name="dolby_profile_music">Música</string>
+-    <string name="dolby_profile_off">Sense perfil</string>
+-    <string name="dolby_profile_spacial_audio">Àudio espacial</string>
+-    <string name="dolby_profile_voice">Veu</string>
+ </resources>
+diff --git a/dap/res/values-cs/strings.xml b/dap/res/values-cs/strings.xml
+index fa6005c..045e125 100644
+--- a/dap/res/values-cs/strings.xml
++++ b/dap/res/values-cs/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Povolit Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Zažijte průlomový zvuk při přehrávání médií, který proudí nad vámi a kolem vás</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Hra</string>
+-    <string name="dolby_profile_game_1">Hra 1</string>
+-    <string name="dolby_profile_game_2">Hra 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Hudba</string>
+-    <string name="dolby_profile_off">Žádný profil</string>
+-    <string name="dolby_profile_spacial_audio">Prostorový zvuk</string>
+-    <string name="dolby_profile_voice">Hlas</string>
+ </resources>
+diff --git a/dap/res/values-cy/strings.xml b/dap/res/values-cy/strings.xml
+index 78ad1e6..045e125 100644
+--- a/dap/res/values-cy/strings.xml
++++ b/dap/res/values-cy/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Galluogi Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Cael profiad sain gofodol sy\'n llifo uwch dy ben ac o dy amgylch wrth chwarae cyfryngau.</string>
+-    <string name="dolby_profile_auto">Awto</string>
+-    <string name="dolby_profile_game">Gêm</string>
+-    <string name="dolby_profile_game_1">Gêm 1</string>
+-    <string name="dolby_profile_game_2">Gêm 2</string>
+-    <string name="dolby_profile_movie">Ffilm</string>
+-    <string name="dolby_profile_music">Cerddoriaeth</string>
+-    <string name="dolby_profile_off">Dim proffil</string>
+-    <string name="dolby_profile_spacial_audio">Sain gofodol</string>
+-    <string name="dolby_profile_voice">Llais</string>
+ </resources>
+diff --git a/dap/res/values-de/strings.xml b/dap/res/values-de/strings.xml
+index cf3efd0..045e125 100644
+--- a/dap/res/values-de/strings.xml
++++ b/dap/res/values-de/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Dolby Atmos aktivieren</string>
+-    <string name="dolby_top_intro_summary">Komm in den Genuss einer fortschrittlichen Medienwiedergabe mit einem Klang, der sich über dir und um dich herum entfaltet</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Spiel</string>
+-    <string name="dolby_profile_game_1">Spiel 1</string>
+-    <string name="dolby_profile_game_2">Spiel 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Musik</string>
+-    <string name="dolby_profile_off">Kein Profil</string>
+-    <string name="dolby_profile_spacial_audio">Raumklang</string>
+-    <string name="dolby_profile_voice">Sprache</string>
+ </resources>
+diff --git a/dap/res/values-el/strings.xml b/dap/res/values-el/strings.xml
+index f826d58..045e125 100644
+--- a/dap/res/values-el/strings.xml
++++ b/dap/res/values-el/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Ενεργοποίηση Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Απολαύστε πρωτοποριακό ήχο για αναπαραγωγή πολυμέσων που ρέει πάνω και γύρω σας</string>
+-    <string name="dolby_profile_auto">Αυτόματο</string>
+-    <string name="dolby_profile_game">Παιχνίδι</string>
+-    <string name="dolby_profile_game_1">Παιχνίδι 1</string>
+-    <string name="dolby_profile_game_2">Παιχνίδι 2</string>
+-    <string name="dolby_profile_movie">Ταινία</string>
+-    <string name="dolby_profile_music">Μουσική</string>
+-    <string name="dolby_profile_off">Κανένα προφίλ</string>
+-    <string name="dolby_profile_spacial_audio">Χωρικός ήχος</string>
+-    <string name="dolby_profile_voice">Φωνή</string>
+ </resources>
+diff --git a/dap/res/values-en-rAU/strings.xml b/dap/res/values-en-rAU/strings.xml
+index cd33a0a..045e125 100644
+--- a/dap/res/values-en-rAU/strings.xml
++++ b/dap/res/values-en-rAU/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Enable Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experience breakthrough audio for media playback that flows above and around you</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Game</string>
+-    <string name="dolby_profile_game_1">Game 1</string>
+-    <string name="dolby_profile_game_2">Game 2</string>
+-    <string name="dolby_profile_movie">Movie</string>
+-    <string name="dolby_profile_music">Music</string>
+-    <string name="dolby_profile_off">No profile</string>
+-    <string name="dolby_profile_spacial_audio">Spacial audio</string>
+-    <string name="dolby_profile_voice">Voice</string>
+ </resources>
+diff --git a/dap/res/values-en-rCA/strings.xml b/dap/res/values-en-rCA/strings.xml
+index cd33a0a..045e125 100644
+--- a/dap/res/values-en-rCA/strings.xml
++++ b/dap/res/values-en-rCA/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Enable Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experience breakthrough audio for media playback that flows above and around you</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Game</string>
+-    <string name="dolby_profile_game_1">Game 1</string>
+-    <string name="dolby_profile_game_2">Game 2</string>
+-    <string name="dolby_profile_movie">Movie</string>
+-    <string name="dolby_profile_music">Music</string>
+-    <string name="dolby_profile_off">No profile</string>
+-    <string name="dolby_profile_spacial_audio">Spacial audio</string>
+-    <string name="dolby_profile_voice">Voice</string>
+ </resources>
+diff --git a/dap/res/values-en-rGB/strings.xml b/dap/res/values-en-rGB/strings.xml
+index cd33a0a..045e125 100644
+--- a/dap/res/values-en-rGB/strings.xml
++++ b/dap/res/values-en-rGB/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Enable Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experience breakthrough audio for media playback that flows above and around you</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Game</string>
+-    <string name="dolby_profile_game_1">Game 1</string>
+-    <string name="dolby_profile_game_2">Game 2</string>
+-    <string name="dolby_profile_movie">Movie</string>
+-    <string name="dolby_profile_music">Music</string>
+-    <string name="dolby_profile_off">No profile</string>
+-    <string name="dolby_profile_spacial_audio">Spacial audio</string>
+-    <string name="dolby_profile_voice">Voice</string>
+ </resources>
+diff --git a/dap/res/values-en-rIN/strings.xml b/dap/res/values-en-rIN/strings.xml
+index cd33a0a..045e125 100644
+--- a/dap/res/values-en-rIN/strings.xml
++++ b/dap/res/values-en-rIN/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Enable Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experience breakthrough audio for media playback that flows above and around you</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Game</string>
+-    <string name="dolby_profile_game_1">Game 1</string>
+-    <string name="dolby_profile_game_2">Game 2</string>
+-    <string name="dolby_profile_movie">Movie</string>
+-    <string name="dolby_profile_music">Music</string>
+-    <string name="dolby_profile_off">No profile</string>
+-    <string name="dolby_profile_spacial_audio">Spacial audio</string>
+-    <string name="dolby_profile_voice">Voice</string>
+ </resources>
+diff --git a/dap/res/values-es/strings.xml b/dap/res/values-es/strings.xml
+index b12a5ed..8701858 100644
+--- a/dap/res/values-es/strings.xml
++++ b/dap/res/values-es/strings.xml
+@@ -1,14 +1,50 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Activar Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experimenta un sonido innovador para la reproducción de medios que fluye por encima de ti y a tu alrededor</string>
++    <string name="dolby_title" translatable="false">Efectos de sonido</string>
++    <string name="soundalive_enable_title">Activar SoundAlive</string>
++    <string name="soundalive_enable_summary">Añade el ecualizador encima de la curva del altavoz de la stock. Apagado, el sonido vuelve al ajuste de stock; esa curva no se toca nunca.</string>
++    <string name="soundalive_intro">Ecualizador de Samsung. Solo actúa en el altavoz: ahí va debajo la curva del DSP de la stock y estos perfiles suman su curva encima. Con auriculares, USB o Bluetooth no se aplica ningún efecto de SoundAlive.</string>
++    <string name="soundalive_intro_own">Perfiles propios</string>
++    <string name="soundalive_preset_neutral">Neutro (stock)</string>
++    <string name="soundalive_preset_bass">Graves</string>
++    <string name="soundalive_preset_bass_max">Graves máximos</string>
++    <string name="soundalive_intro_samsung">Perfiles de Samsung</string>
++    <string name="soundalive_preset_sa_pop">Pop</string>
++    <string name="soundalive_preset_sa_classic">Clásica</string>
++    <string name="soundalive_preset_sa_jazz">Jazz</string>
++    <string name="soundalive_preset_sa_rock">Rock</string>
++    <string name="soundalive_intro_custom">Ecualizador manual</string>
++    <string name="soundalive_preset_custom">Personalizado</string>
++    <string name="soundalive_equalizer_title">Ecualizador de 9 bandas</string>
++    <string name="soundalive_surround_title">3D</string>
++    <string name="soundalive_surround_summary">Amplía el escenario sonoro (MySpace, efecto aparte). Samsung solo lo usa con auriculares.</string>
++    <string name="soundalive_tube_amp">Amplificador de válvulas</string>
++    <string name="soundalive_tube_amp_summary">Coloración de válvulas del motor de Samsung (mGlobalTubeAmp). Sutil.</string>
++
++    <string name="dolby_intro">Dolby Atmos: el motor Dolby real de la tablet (libswdap). Funciona junto con el ecualizador de SoundAlive, como en la stock; solo se desactiva el 3D mientras está activo.</string>
++    <string name="dolby_enable_title">Dolby Atmos</string>
++    <string name="dolby_enable_summary">Procesado Dolby con el perfil elegido abajo.</string>
+     <string name="dolby_profile_auto">Automático</string>
+-    <string name="dolby_profile_game">Juego</string>
+-    <string name="dolby_profile_game_1">Juego 1</string>
+-    <string name="dolby_profile_game_2">Juego 2</string>
+-    <string name="dolby_profile_movie">Cine</string>
++    <string name="dolby_profile_auto_summary">Optimiza el sonido automáticamente para lo que estés escuchando.</string>
++    <string name="dolby_profile_movie">Película</string>
++    <string name="dolby_profile_movie_summary">El mejor audio posible para películas, series y vídeos.</string>
+     <string name="dolby_profile_music">Música</string>
+-    <string name="dolby_profile_off">Sin perfil</string>
+-    <string name="dolby_profile_spacial_audio">Audio espacial</string>
++    <string name="dolby_profile_music_summary">Música más rica, con más cuerpo y más equilibrada.</string>
+     <string name="dolby_profile_voice">Voz</string>
++    <string name="dolby_profile_voice_summary">Hace que las voces suenen altas y claras.</string>
++    <string name="dolby_game_title">Dolby Atmos para juegos</string>
++    <string name="dolby_game_summary">Usa el perfil de juegos del motor Dolby.</string>
++    <string name="soundalive_device_title">Dispositivo de salida</string>
++    <string name="route_speaker">Altavoz</string>
++    <string name="route_wired">Auriculares</string>
++    <string name="route_bluetooth">Bluetooth</string>
++    <string name="route_bluetooth_named">Bluetooth (%1$s)</string>
++    <string name="route_usb">USB</string>
++    <string name="route_usb_named">USB (%1$s)</string>
++    <string name="route_hdmi">HDMI</string>
++    <string name="route_line">Entrada de línea</string>
++    <string name="route_other">Salida %1$d</string>
++    <string name="soundalive_only_speaker">Solo altavoz</string>
++    <string name="soundalive_only_speaker_summary">%1$s · Solo altavoz</string>
++    <string name="soundalive_eq_category">Ecualizador</string>
+ </resources>
+diff --git a/dap/res/values-fr/strings.xml b/dap/res/values-fr/strings.xml
+index 68555fd..045e125 100644
+--- a/dap/res/values-fr/strings.xml
++++ b/dap/res/values-fr/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Activer Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Expérimentez un son révolutionnaire pour la lecture des médias qui circule tout autour de vous</string>
+-    <string name="dolby_profile_auto">Automatique</string>
+-    <string name="dolby_profile_game">Jeu</string>
+-    <string name="dolby_profile_game_1">Jeu 1</string>
+-    <string name="dolby_profile_game_2">Jeu 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Musique</string>
+-    <string name="dolby_profile_off">Aucun profil</string>
+-    <string name="dolby_profile_spacial_audio">Audio spatial</string>
+-    <string name="dolby_profile_voice">Voix</string>
+ </resources>
+diff --git a/dap/res/values-fur-rIT/strings.xml b/dap/res/values-fur-rIT/strings.xml
+index 3896d18..045e125 100644
+--- a/dap/res/values-fur-rIT/strings.xml
++++ b/dap/res/values-fur-rIT/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Abilite il Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Gjolditi une esperience audio che ti cjape dentri dulinvie lis riproduzions di contignûts multimediâi</string>
+-    <string name="dolby_profile_auto">Automatic</string>
+-    <string name="dolby_profile_game">Zûc</string>
+-    <string name="dolby_profile_game_1">Zûc 1</string>
+-    <string name="dolby_profile_game_2">Zûc 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Musiche</string>
+-    <string name="dolby_profile_off">Nissun profîl</string>
+-    <string name="dolby_profile_spacial_audio">Audio spaziâl</string>
+-    <string name="dolby_profile_voice">Vôs</string>
+ </resources>
+diff --git a/dap/res/values-ga-rIE/strings.xml b/dap/res/values-ga-rIE/strings.xml
+index a1dfe6a..045e125 100644
+--- a/dap/res/values-ga-rIE/strings.xml
++++ b/dap/res/values-ga-rIE/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Cumasaigh Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Taithí fuaime cinn le haghaidh athsheinm meáin a shreabhann thuas agus timpeall ort</string>
+-    <string name="dolby_profile_auto">Uath</string>
+-    <string name="dolby_profile_game">Cluiche</string>
+-    <string name="dolby_profile_game_1">Cluiche 1</string>
+-    <string name="dolby_profile_game_2">Cluiche 2</string>
+-    <string name="dolby_profile_movie">Scannán</string>
+-    <string name="dolby_profile_music">Ceol</string>
+-    <string name="dolby_profile_off">Gan próifíl</string>
+-    <string name="dolby_profile_spacial_audio">Fuaim spásúil</string>
+-    <string name="dolby_profile_voice">Guth</string>
+ </resources>
+diff --git a/dap/res/values-hu/strings.xml b/dap/res/values-hu/strings.xml
+index 3b3a29b..045e125 100644
+--- a/dap/res/values-hu/strings.xml
++++ b/dap/res/values-hu/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Dolby Atmos be</string>
+-    <string name="dolby_top_intro_summary">Az Ön kürül hallható médialejátszások áttörő audióélménye</string>
+-    <string name="dolby_profile_auto">Automatikus</string>
+-    <string name="dolby_profile_game">Játék</string>
+-    <string name="dolby_profile_game_1">Játék1</string>
+-    <string name="dolby_profile_game_2">Játék2</string>
+-    <string name="dolby_profile_movie">Mozi</string>
+-    <string name="dolby_profile_music">Zene</string>
+-    <string name="dolby_profile_off">Nincs profil</string>
+-    <string name="dolby_profile_spacial_audio">Speciális hangzás</string>
+-    <string name="dolby_profile_voice">Hang</string>
+ </resources>
+diff --git a/dap/res/values-in/strings.xml b/dap/res/values-in/strings.xml
+index b37b000..045e125 100644
+--- a/dap/res/values-in/strings.xml
++++ b/dap/res/values-in/strings.xml
+@@ -1,13 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Aktifkan Dolby Atmos</string>
+-    <string name="dolby_profile_auto">Otomatis</string>
+-    <string name="dolby_profile_game">Game</string>
+-    <string name="dolby_profile_game_1">Game 1</string>
+-    <string name="dolby_profile_game_2">Game 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Musik</string>
+-    <string name="dolby_profile_off">Tidak ada profil</string>
+-    <string name="dolby_profile_spacial_audio">Spasial audio</string>
+-    <string name="dolby_profile_voice">Suara</string>
+ </resources>
+diff --git a/dap/res/values-is/strings.xml b/dap/res/values-is/strings.xml
+index fda0134..045e125 100644
+--- a/dap/res/values-is/strings.xml
++++ b/dap/res/values-is/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Virkja Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Upplifðu framúrskarandi hljómgæði fyrir afspilun margmiðlunar sem flæðir fyrir ofan þig og í kring</string>
+-    <string name="dolby_profile_auto">Sjálfvirkt</string>
+-    <string name="dolby_profile_game">Leikur</string>
+-    <string name="dolby_profile_game_1">Leikur 1</string>
+-    <string name="dolby_profile_game_2">Leikur 2</string>
+-    <string name="dolby_profile_movie">Kvikmynd</string>
+-    <string name="dolby_profile_music">Tónlist</string>
+-    <string name="dolby_profile_off">Ekkert snið</string>
+-    <string name="dolby_profile_spacial_audio">Rýmishljómur</string>
+-    <string name="dolby_profile_voice">Tal</string>
+ </resources>
+diff --git a/dap/res/values-it/strings.xml b/dap/res/values-it/strings.xml
+index 763b633..045e125 100644
+--- a/dap/res/values-it/strings.xml
++++ b/dap/res/values-it/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Abilita Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Goditi un\'esperienza audio coinvolgente durante la riproduzione di contenuti multimediali</string>
+-    <string name="dolby_profile_auto">Automatico</string>
+-    <string name="dolby_profile_game">Gioco</string>
+-    <string name="dolby_profile_game_1">Gioco 1</string>
+-    <string name="dolby_profile_game_2">Gioco 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Musica</string>
+-    <string name="dolby_profile_off">Nessun profilo</string>
+-    <string name="dolby_profile_spacial_audio">Audio spaziale</string>
+-    <string name="dolby_profile_voice">Voce</string>
+ </resources>
+diff --git a/dap/res/values-ja/strings.xml b/dap/res/values-ja/strings.xml
+index 653d944..045e125 100644
+--- a/dap/res/values-ja/strings.xml
++++ b/dap/res/values-ja/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Dolby Atmos を有効化</string>
+-    <string name="dolby_top_intro_summary">迫力ある、臨場感あふれるサウンドをお楽しみください</string>
+-    <string name="dolby_profile_auto">自動</string>
+-    <string name="dolby_profile_game">ゲーム</string>
+-    <string name="dolby_profile_game_1">ゲーム1</string>
+-    <string name="dolby_profile_game_2">ゲーム2</string>
+-    <string name="dolby_profile_movie">動画</string>
+-    <string name="dolby_profile_music">音楽</string>
+-    <string name="dolby_profile_off">プロファイルなし</string>
+-    <string name="dolby_profile_spacial_audio">スペーシャルオーディオ</string>
+-    <string name="dolby_profile_voice">音声</string>
+ </resources>
+diff --git a/dap/res/values-ka/strings.xml b/dap/res/values-ka/strings.xml
+index aaf8ef5..045e125 100644
+--- a/dap/res/values-ka/strings.xml
++++ b/dap/res/values-ka/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">ჩაირთოს Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">ფაილის გაშვებისას ხმის სრულად შეგრძნება გარსშემოდენით</string>
+-    <string name="dolby_profile_auto">თვითშერჩევა</string>
+-    <string name="dolby_profile_game">თამაში</string>
+-    <string name="dolby_profile_game_1">თამაში 1</string>
+-    <string name="dolby_profile_game_2">თამაში 2</string>
+-    <string name="dolby_profile_movie">ფილმი</string>
+-    <string name="dolby_profile_music">მუსიკა</string>
+-    <string name="dolby_profile_off">პროფილის გარეშე</string>
+-    <string name="dolby_profile_spacial_audio">სივრცული ხმა</string>
+-    <string name="dolby_profile_voice">ხმა</string>
+ </resources>
+diff --git a/dap/res/values-ko/strings.xml b/dap/res/values-ko/strings.xml
+index 5d0ff87..045e125 100644
+--- a/dap/res/values-ko/strings.xml
++++ b/dap/res/values-ko/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">돌비 애트모스 사용</string>
+-    <string name="dolby_top_intro_summary">사용자 주변을 타고 흐르는 듯한 강력하고 생동감 있는 오디오 경험 제공</string>
+-    <string name="dolby_profile_auto">자동</string>
+-    <string name="dolby_profile_game">게임</string>
+-    <string name="dolby_profile_game_1">게임 1</string>
+-    <string name="dolby_profile_game_2">게임 2</string>
+-    <string name="dolby_profile_movie">영화</string>
+-    <string name="dolby_profile_music">음악</string>
+-    <string name="dolby_profile_off">프로필 없음</string>
+-    <string name="dolby_profile_spacial_audio">공간 음향</string>
+-    <string name="dolby_profile_voice">음성</string>
+ </resources>
+diff --git a/dap/res/values-nl/strings.xml b/dap/res/values-nl/strings.xml
+index d4618a6..045e125 100644
+--- a/dap/res/values-nl/strings.xml
++++ b/dap/res/values-nl/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Dolby Atmos inschakelen</string>
+-    <string name="dolby_top_intro_summary">Ervaar de doorbraakaudio voor het afspelen van media die boven en om je heen stromen</string>
+-    <string name="dolby_profile_auto">Automatisch</string>
+-    <string name="dolby_profile_game">Spel</string>
+-    <string name="dolby_profile_game_1">Spel 1</string>
+-    <string name="dolby_profile_game_2">Spel 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Muziek</string>
+-    <string name="dolby_profile_off">Geen profiel</string>
+-    <string name="dolby_profile_spacial_audio">Ruimtelijke audio</string>
+-    <string name="dolby_profile_voice">Stem</string>
+ </resources>
+diff --git a/dap/res/values-pl/strings.xml b/dap/res/values-pl/strings.xml
+index 01f1ca6..045e125 100644
+--- a/dap/res/values-pl/strings.xml
++++ b/dap/res/values-pl/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Włącz Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Doświadcz przełomowego dźwięku podczas odtwarzania multimediów, który przepływa powyżej i wokół ciebie</string>
+-    <string name="dolby_profile_auto">Automatyczny</string>
+-    <string name="dolby_profile_game">Gra</string>
+-    <string name="dolby_profile_game_1">Gra 1</string>
+-    <string name="dolby_profile_game_2">Gra 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Muzyka</string>
+-    <string name="dolby_profile_off">Bez profilu</string>
+-    <string name="dolby_profile_spacial_audio">Dźwięk przestrzenny</string>
+-    <string name="dolby_profile_voice">Głos</string>
+ </resources>
+diff --git a/dap/res/values-pt-rBR/strings.xml b/dap/res/values-pt-rBR/strings.xml
+index 89d3375..045e125 100644
+--- a/dap/res/values-pt-rBR/strings.xml
++++ b/dap/res/values-pt-rBR/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Ativar Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experimente uma mudança dramática no áudio para reprodução de mídia que flui acima e ao seu redor</string>
+-    <string name="dolby_profile_auto">Automático</string>
+-    <string name="dolby_profile_game">Jogo</string>
+-    <string name="dolby_profile_game_1">Jogo 1</string>
+-    <string name="dolby_profile_game_2">Jogo 2</string>
+-    <string name="dolby_profile_movie">Filme</string>
+-    <string name="dolby_profile_music">Música</string>
+-    <string name="dolby_profile_off">Nenhum perfil</string>
+-    <string name="dolby_profile_spacial_audio">Áudio espacial</string>
+-    <string name="dolby_profile_voice">Voz</string>
+ </resources>
+diff --git a/dap/res/values-pt-rPT/strings.xml b/dap/res/values-pt-rPT/strings.xml
+index f6e7676..045e125 100644
+--- a/dap/res/values-pt-rPT/strings.xml
++++ b/dap/res/values-pt-rPT/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Ativar Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experiencie reprodução de multimédia com áudio inovador que flui em todo o seu redor</string>
+-    <string name="dolby_profile_auto">Automático</string>
+-    <string name="dolby_profile_game">Jogo</string>
+-    <string name="dolby_profile_game_1">Jogo 1</string>
+-    <string name="dolby_profile_game_2">Jogo 2</string>
+-    <string name="dolby_profile_movie">Filme</string>
+-    <string name="dolby_profile_music">Música</string>
+-    <string name="dolby_profile_off">Sem perfil</string>
+-    <string name="dolby_profile_spacial_audio">Áudio espacial</string>
+-    <string name="dolby_profile_voice">Voz</string>
+ </resources>
+diff --git a/dap/res/values-ro/strings.xml b/dap/res/values-ro/strings.xml
+index ac639f8..045e125 100644
+--- a/dap/res/values-ro/strings.xml
++++ b/dap/res/values-ro/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Activează Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Experimentați un audio revoluționar pentru redarea media care \"curge\" deasupra și dedesubtul dvs.</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Joc</string>
+-    <string name="dolby_profile_game_1">Joc 1</string>
+-    <string name="dolby_profile_game_2">Joc 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Muzică</string>
+-    <string name="dolby_profile_off">Niciun profil</string>
+-    <string name="dolby_profile_spacial_audio">Audio spațial</string>
+-    <string name="dolby_profile_voice">Voce</string>
+ </resources>
+diff --git a/dap/res/values-ru/strings.xml b/dap/res/values-ru/strings.xml
+index e89b5a8..045e125 100644
+--- a/dap/res/values-ru/strings.xml
++++ b/dap/res/values-ru/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Включить Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Испытайте революционный звук для воспроизведения мультимедиа, который струится над вами и вокруг вас</string>
+-    <string name="dolby_profile_auto">Авто</string>
+-    <string name="dolby_profile_game">Игра</string>
+-    <string name="dolby_profile_game_1">Игра 1</string>
+-    <string name="dolby_profile_game_2">Игра 2</string>
+-    <string name="dolby_profile_movie">Фильм</string>
+-    <string name="dolby_profile_music">Музыка</string>
+-    <string name="dolby_profile_off">Без профиля</string>
+-    <string name="dolby_profile_spacial_audio">Пространственный звук</string>
+-    <string name="dolby_profile_voice">Голос</string>
+ </resources>
+diff --git a/dap/res/values-sl/strings.xml b/dap/res/values-sl/strings.xml
+index ed1d1db..045e125 100644
+--- a/dap/res/values-sl/strings.xml
++++ b/dap/res/values-sl/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Omogoči Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Izkusite prodoren zvok za predvajanje predstavnosti, ki kroži nad in okoli vas</string>
+-    <string name="dolby_profile_auto">Samodejno</string>
+-    <string name="dolby_profile_game">Igra</string>
+-    <string name="dolby_profile_game_1">Igra 1</string>
+-    <string name="dolby_profile_game_2">Igra 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Glasba</string>
+-    <string name="dolby_profile_off">Brez profila</string>
+-    <string name="dolby_profile_spacial_audio">Prostorski zvok</string>
+-    <string name="dolby_profile_voice">Glas</string>
+ </resources>
+diff --git a/dap/res/values-sq/strings.xml b/dap/res/values-sq/strings.xml
+index 138bf4a..045e125 100644
+--- a/dap/res/values-sq/strings.xml
++++ b/dap/res/values-sq/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Aktivizo Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Përjetoni audion e re për riprodhimin e medias që rrjedh sipër dhe rreth jush</string>
+-    <string name="dolby_profile_auto">Automatike</string>
+-    <string name="dolby_profile_game">Lojë</string>
+-    <string name="dolby_profile_game_1">Loja 1</string>
+-    <string name="dolby_profile_game_2">Loja 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Muzikë</string>
+-    <string name="dolby_profile_off">Asnjë profil</string>
+-    <string name="dolby_profile_spacial_audio">Audio hapësinore</string>
+-    <string name="dolby_profile_voice">Zë</string>
+ </resources>
+diff --git a/dap/res/values-sv/strings.xml b/dap/res/values-sv/strings.xml
+index 5210b42..045e125 100644
+--- a/dap/res/values-sv/strings.xml
++++ b/dap/res/values-sv/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Aktivera Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">Upplev banbrytande ljud för mediauppspelning som flödar över och runt dig</string>
+-    <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Spel</string>
+-    <string name="dolby_profile_game_1">Spel 1</string>
+-    <string name="dolby_profile_game_2">Spel 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Musik</string>
+-    <string name="dolby_profile_off">Ingen profil</string>
+-    <string name="dolby_profile_spacial_audio">Rymligt ljud</string>
+-    <string name="dolby_profile_voice">Röst</string>
+ </resources>
+diff --git a/dap/res/values-tr/strings.xml b/dap/res/values-tr/strings.xml
+index 5a1b402..045e125 100644
+--- a/dap/res/values-tr/strings.xml
++++ b/dap/res/values-tr/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Dolby Atmos\'u etkinleştir</string>
+-    <string name="dolby_top_intro_summary">Medya oynatma için sizi kuşatan çığır açıcı sesi deneyimleyin</string>
+-    <string name="dolby_profile_auto">Otomatik</string>
+-    <string name="dolby_profile_game">Oyun</string>
+-    <string name="dolby_profile_game_1">Oyun 1</string>
+-    <string name="dolby_profile_game_2">Oyun 2</string>
+-    <string name="dolby_profile_movie">Film</string>
+-    <string name="dolby_profile_music">Müzik</string>
+-    <string name="dolby_profile_off">Profil yok</string>
+-    <string name="dolby_profile_spacial_audio">Özel ses</string>
+-    <string name="dolby_profile_voice">Ses</string>
+ </resources>
+diff --git a/dap/res/values-vi/strings.xml b/dap/res/values-vi/strings.xml
+index 3ae6765..045e125 100644
+--- a/dap/res/values-vi/strings.xml
++++ b/dap/res/values-vi/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">Bật Công nghệ âm thanh vòm</string>
+-    <string name="dolby_top_intro_summary">Trải nghiệm âm thanh đột phá cho việc phát lại phương tiện truyền thông lan tỏa từ trên cao và xung quanh bạn</string>
+-    <string name="dolby_profile_auto">Tự động</string>
+-    <string name="dolby_profile_game">Trò chơi</string>
+-    <string name="dolby_profile_game_1">Trò chơi 1</string>
+-    <string name="dolby_profile_game_2">Trò chơi 2</string>
+-    <string name="dolby_profile_movie">Phim</string>
+-    <string name="dolby_profile_music">Nhạc</string>
+-    <string name="dolby_profile_off">Không có cấu hình</string>
+-    <string name="dolby_profile_spacial_audio">Âm thanh không gian</string>
+-    <string name="dolby_profile_voice">Thoại</string>
+ </resources>
+diff --git a/dap/res/values-zh-rCN/strings.xml b/dap/res/values-zh-rCN/strings.xml
+index ce5f306..045e125 100644
+--- a/dap/res/values-zh-rCN/strings.xml
++++ b/dap/res/values-zh-rCN/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">启用 Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">在您的上方和周围的媒体播放体验突破性的音频</string>
+-    <string name="dolby_profile_auto">自动</string>
+-    <string name="dolby_profile_game">游戏</string>
+-    <string name="dolby_profile_game_1">游戏 1</string>
+-    <string name="dolby_profile_game_2">游戏 2</string>
+-    <string name="dolby_profile_movie">电影</string>
+-    <string name="dolby_profile_music">音乐</string>
+-    <string name="dolby_profile_off">没有配置文件</string>
+-    <string name="dolby_profile_spacial_audio">空间音频</string>
+-    <string name="dolby_profile_voice">语音</string>
+ </resources>
+diff --git a/dap/res/values-zh-rTW/strings.xml b/dap/res/values-zh-rTW/strings.xml
+index e88b7a1..045e125 100644
+--- a/dap/res/values-zh-rTW/strings.xml
++++ b/dap/res/values-zh-rTW/strings.xml
+@@ -1,14 +1,3 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="dolby_enable_title">啟用 Dolby Atmos</string>
+-    <string name="dolby_top_intro_summary">透過突破性的音效技術，感受親臨現場的效果</string>
+-    <string name="dolby_profile_auto">自動</string>
+-    <string name="dolby_profile_game">遊戲</string>
+-    <string name="dolby_profile_game_1">遊戲 1</string>
+-    <string name="dolby_profile_game_2">遊戲 2</string>
+-    <string name="dolby_profile_movie">電影</string>
+-    <string name="dolby_profile_music">音樂</string>
+-    <string name="dolby_profile_off">無設定檔</string>
+-    <string name="dolby_profile_spacial_audio">空間音訊</string>
+-    <string name="dolby_profile_voice">語音</string>
+ </resources>
+diff --git a/dap/res/values/strings.xml b/dap/res/values/strings.xml
+index 6351f44..a6f51d7 100644
+--- a/dap/res/values/strings.xml
++++ b/dap/res/values/strings.xml
+@@ -1,22 +1,50 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <!-- Title -->
+-    <string name="dolby_title" translatable="false">Dolby Atmos</string>
++    <string name="dolby_title" translatable="false">Sound effects</string>
++    <string name="soundalive_enable_title">Enable SoundAlive</string>
++    <string name="soundalive_enable_summary">Adds the equalizer on top of the stock speaker curve. Turned off, the sound goes back to the stock tuning; that curve is never touched.</string>
++    <string name="soundalive_intro">Samsung equalizer. It only works on the speaker: there the stock DSP curve goes underneath and these profiles add their curve on top. With headphones, USB or Bluetooth no SoundAlive effect is applied at all.</string>
++    <string name="soundalive_intro_own">Own profiles</string>
++    <string name="soundalive_preset_neutral">Neutral (stock)</string>
++    <string name="soundalive_preset_bass">Bass</string>
++    <string name="soundalive_preset_bass_max">Maximum bass</string>
++    <string name="soundalive_intro_samsung">Samsung profiles</string>
++    <string name="soundalive_preset_sa_pop">Pop</string>
++    <string name="soundalive_preset_sa_classic">Classic</string>
++    <string name="soundalive_preset_sa_jazz">Jazz</string>
++    <string name="soundalive_preset_sa_rock">Rock</string>
++    <string name="soundalive_intro_custom">Manual equalizer</string>
++    <string name="soundalive_preset_custom">Custom</string>
++    <string name="soundalive_equalizer_title">9-band equalizer</string>
++    <string name="soundalive_surround_title">3D</string>
++    <string name="soundalive_surround_summary">Widens the sound stage (MySpace, a separate effect). Samsung only uses it with headphones.</string>
++    <string name="soundalive_tube_amp">Tube amp</string>
++    <string name="soundalive_tube_amp_summary">Tube colouration of the Samsung engine (mGlobalTubeAmp). Subtle.</string>
+ 
+-    <!-- Switch bar -->
+-    <string name="dolby_enable_title">Enable Dolby Atmos</string>
+-
+-    <!-- Intro -->
+-    <string name="dolby_top_intro_summary">Experience breakthrough audio for media playback that flows above and around you</string>
+-
+-    <!-- Profiles -->
++    <string name="dolby_intro">Dolby Atmos - the real Dolby engine of this tablet (libswdap). It works together with the SoundAlive equalizer, as in stock; only 3D is switched off while it is on.</string>
++    <string name="dolby_enable_title">Dolby Atmos</string>
++    <string name="dolby_enable_summary">Dolby processing with the profile chosen below.</string>
+     <string name="dolby_profile_auto">Auto</string>
+-    <string name="dolby_profile_game">Game</string>
+-    <string name="dolby_profile_game_1">Game 1</string>
+-    <string name="dolby_profile_game_2">Game 2</string>
++    <string name="dolby_profile_auto_summary">Optimises the sound automatically for whatever you are listening to.</string>
+     <string name="dolby_profile_movie">Movie</string>
++    <string name="dolby_profile_movie_summary">Best possible audio for films, shows and videos.</string>
+     <string name="dolby_profile_music">Music</string>
+-    <string name="dolby_profile_off">No profile</string>
+-    <string name="dolby_profile_spacial_audio">Spacial audio</string>
++    <string name="dolby_profile_music_summary">Richer, fuller and more balanced music.</string>
+     <string name="dolby_profile_voice">Voice</string>
++    <string name="dolby_profile_voice_summary">Makes voices loud and clear.</string>
++    <string name="dolby_game_title">Dolby Atmos for gaming</string>
++    <string name="dolby_game_summary">Uses the game profile of the Dolby engine.</string>
++    <string name="soundalive_device_title">Output device</string>
++    <string name="route_speaker">Speaker</string>
++    <string name="route_wired">Headphones</string>
++    <string name="route_bluetooth">Bluetooth</string>
++    <string name="route_bluetooth_named">Bluetooth (%1$s)</string>
++    <string name="route_usb">USB</string>
++    <string name="route_usb_named">USB (%1$s)</string>
++    <string name="route_hdmi">HDMI</string>
++    <string name="route_line">Line in</string>
++    <string name="route_other">Output %1$d</string>
++    <string name="soundalive_only_speaker">Speaker only</string>
++    <string name="soundalive_only_speaker_summary">%1$s · Speaker only</string>
++    <string name="soundalive_eq_category">Ecualizador</string>
+ </resources>
+diff --git a/dap/res/xml/dolby_settings.xml b/dap/res/xml/dolby_settings.xml
+index 720dbb4..8350a28 100644
+--- a/dap/res/xml/dolby_settings.xml
++++ b/dap/res/xml/dolby_settings.xml
+@@ -3,59 +3,91 @@
+     xmlns:android="http://schemas.android.com/apk/res/android"
+     android:title="@string/dolby_title">
+ 
+-    <com.android.settingslib.widget.TopIntroPreference
+-        android:key="dolby_top_intro"
+-        android:title="@string/dolby_top_intro_summary" />
+-
+-    <com.android.settingslib.widget.MainSwitchPreference
+-        android:defaultValue="false"
+-        android:key="dolby_enable"
+-        android:title="@string/dolby_enable_title" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:defaultValue="true"
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_auto"
+-        android:title="@string/dolby_profile_auto" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_game"
+-        android:title="@string/dolby_profile_game" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_game_1"
+-        android:title="@string/dolby_profile_game_1" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_game_2"
+-        android:title="@string/dolby_profile_game_2" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_movie"
+-        android:title="@string/dolby_profile_movie" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_music"
+-        android:title="@string/dolby_profile_music" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_off"
+-        android:title="@string/dolby_profile_off" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_spacial_audio"
+-        android:title="@string/dolby_profile_spacial_audio" />
+-
+-    <com.android.settingslib.widget.SelectorWithWidgetPreference
+-        android:dependency="dolby_enable"
+-        android:key="dolby_profile_voice"
+-        android:title="@string/dolby_profile_voice" />
+-
+-</PreferenceScreen>
++    <!-- Dolby Atmos primero: es lo unico que se puede encender. -->
++    <PreferenceCategory android:title="@string/dolby_title">
++
++        <!-- SwitchPreference y no MainSwitchPreference: dos MainSwitchPreference en
++             la misma pantalla comparten el layout reciclado del RecyclerView y sus
++             listeners se mezclan. -->
++        <androidx.preference.SwitchPreference
++            android:defaultValue="false"
++            android:key="dolby_enable"
++            android:summary="@string/dolby_enable_summary"
++            android:title="@string/dolby_enable_title" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="dolby_profile_auto"
++            android:summary="@string/dolby_profile_auto_summary"
++            android:title="@string/dolby_profile_auto" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="dolby_profile_movie"
++            android:summary="@string/dolby_profile_movie_summary"
++            android:title="@string/dolby_profile_movie" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="dolby_profile_music"
++            android:summary="@string/dolby_profile_music_summary"
++            android:title="@string/dolby_profile_music" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="dolby_profile_voice"
++            android:summary="@string/dolby_profile_voice_summary"
++            android:title="@string/dolby_profile_voice" />
++
++        <androidx.preference.SwitchPreference
++            android:defaultValue="false"
++            android:key="dolby_game"
++            android:summary="@string/dolby_game_summary"
++            android:title="@string/dolby_game_title" />
++    </PreferenceCategory>
++
++    <!-- Ecualizador: solo se ve con Dolby encendido. La curva base del altavoz la
++         aplica el efecto siempre, con Dolby encendido o apagado. -->
++    <PreferenceCategory
++        android:key="eq_category"
++        android:title="@string/soundalive_eq_category">
++
++        <Preference
++            android:key="soundalive_device"
++            android:selectable="false"
++            android:title="@string/soundalive_device_title" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_neutral"
++            android:title="@string/soundalive_preset_neutral" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_bass"
++            android:title="@string/soundalive_preset_bass" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_bass_max"
++            android:title="@string/soundalive_preset_bass_max" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_sa_pop"
++            android:title="@string/soundalive_preset_sa_pop" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_sa_classic"
++            android:title="@string/soundalive_preset_sa_classic" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_sa_jazz"
++            android:title="@string/soundalive_preset_sa_jazz" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_sa_rock"
++            android:title="@string/soundalive_preset_sa_rock" />
++
++        <com.android.settingslib.widget.SelectorWithWidgetPreference
++            android:key="soundalive_preset_custom"
++            android:title="@string/soundalive_preset_custom" />
++
++        <org.lineageos.dap.EqualizerPreference
++            android:key="soundalive_equalizer"
++            android:title="@string/soundalive_equalizer_title" />
++    </PreferenceCategory>
++
++</PreferenceScreen>
+\ No newline at end of file
+diff --git a/dap/src/org/lineageos/dap/AudioRoute.kt b/dap/src/org/lineageos/dap/AudioRoute.kt
+new file mode 100644
+index 0000000..1294a83
+--- /dev/null
++++ b/dap/src/org/lineageos/dap/AudioRoute.kt
+@@ -0,0 +1,287 @@
++/*
++ * Copyright (C) 2022 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.lineageos.dap
++
++import android.content.Context
++import android.media.AudioAttributes
++import android.media.AudioDeviceCallback
++import android.media.AudioDeviceInfo
++import android.media.AudioManager
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++
++/**
++ * Vigila por donde esta saliendo el audio y mantiene el estado del dispositivo
++ * activo.
++ *
++ * La curva del DSP del altavoz ([SoundAliveCore.BASE]) es la correccion acustica
++ * del altavoz de la tablet: con auriculares, USB o Bluetooth no tiene sentido y
++ * ademas suena mal (los cascos ya vienen compensados). La stock hace lo mismo:
++ * consulta el tipo de dispositivo actual y solo aplica el refuerzo en el altavoz.
++ *
++ * Cada salida tiene su propia configuracion ([DeviceState]): al cambiar de
++ * dispositivo se aplica la suya, no la del anterior.
++ *
++ * El proceso de la app es persistente y de uid system, asi que basta con registrar
++ * el callback una vez: cuando se enchufan o se quitan cascos se reenvia el estado
++ * a los efectos que ya estan vivos.
++ */
++object AudioRoute {
++    const val KEY_SPEAKER = "speaker"
++
++    private const val TAG = "SamsungDAP"
++
++    fun interface Listener {
++        fun onRouteChanged(key: String, speaker: Boolean)
++    }
++
++    private val externalTypes = intArrayOf(
++            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
++            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
++            AudioDeviceInfo.TYPE_BLE_HEADSET,
++            AudioDeviceInfo.TYPE_BLE_SPEAKER,
++            AudioDeviceInfo.TYPE_BLE_BROADCAST,
++            AudioDeviceInfo.TYPE_USB_DEVICE,
++            AudioDeviceInfo.TYPE_USB_HEADSET,
++            AudioDeviceInfo.TYPE_USB_ACCESSORY,
++            AudioDeviceInfo.TYPE_WIRED_HEADSET,
++            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
++            AudioDeviceInfo.TYPE_HEARING_AID,
++            AudioDeviceInfo.TYPE_HDMI,
++            AudioDeviceInfo.TYPE_HDMI_ARC,
++            AudioDeviceInfo.TYPE_HDMI_EARC,
++            AudioDeviceInfo.TYPE_LINE_ANALOG,
++            AudioDeviceInfo.TYPE_LINE_DIGITAL,
++            AudioDeviceInfo.TYPE_AUX_LINE,
++            AudioDeviceInfo.TYPE_DOCK,
++    )
++
++    private var audioManager: AudioManager? = null
++    private var appContext: Context? = null
++    private var registered = false
++
++    @Volatile private var key = KEY_SPEAKER
++    @Volatile private var label = ""
++    @Volatile private var speaker = true
++
++    private var listener: Listener? = null
++
++    private val callback = object : AudioDeviceCallback() {
++        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) = refresh()
++
++        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) = refresh()
++    }
++
++    fun setListener(value: Listener?) {
++        listener = value
++    }
++
++    @Synchronized
++    fun init(context: Context) {
++        val manager = context.applicationContext
++                ?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
++        if (manager == null) return
++        audioManager = manager
++        appContext = context.applicationContext
++        DeviceState.migrateLegacy(context)
++        if (!registered) {
++            // Solo se da por registrado si el callback se ha registrado de verdad.
++            registered = runCatching {
++                manager.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
++            }.isSuccess
++        }
++        refresh()
++    }
++
++    @Synchronized
++    fun currentKey(): String = key
++
++    @Synchronized
++    fun currentLabel(): String = label
++
++    @Synchronized
++    fun isSpeaker(): Boolean = speaker
++
++    @Synchronized
++    private fun refresh() {
++        val manager = audioManager ?: return
++        val device = resolve(manager)
++        val nowSpeaker = device == null || !isExternal(device.type)
++        val nowKey = if (device == null) KEY_SPEAKER else keyOf(device)
++        val context = appContext
++        val nowLabel = if (device == null) {
++            context?.getString(R.string.route_speaker).orEmpty()
++        } else {
++            labelOf(context, device)
++        }
++        val changed = nowKey != key || nowSpeaker != speaker
++
++        key = nowKey
++        speaker = nowSpeaker
++        label = nowLabel
++
++        if (context != null) {
++            // La ruta va antes que el estado: al apagar SoundAlive fuera del
++            // altavoz hay que soltar el efecto, y eso depende de la ruta.
++            SoundAliveCore.setRoute(nowSpeaker, nowKey)
++            DolbyCore.setRoute(nowSpeaker)
++            DolbyFragment.applyDolby(context)
++            DolbyFragment.applySoundAlive(context)
++        }
++
++        if (changed) {
++            Log.i(TAG, "salida: $nowKey (altavoz=$nowSpeaker)")
++            listener?.onRouteChanged(nowKey, nowSpeaker)
++        }
++    }
++
++    /** Orden de preferencia cuando hay varias salidas externas conectadas. */
++    private val priority = intArrayOf(
++            AudioDeviceInfo.TYPE_USB_HEADSET,
++            AudioDeviceInfo.TYPE_USB_DEVICE,
++            AudioDeviceInfo.TYPE_USB_ACCESSORY,
++            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
++            AudioDeviceInfo.TYPE_BLE_HEADSET,
++            AudioDeviceInfo.TYPE_BLE_SPEAKER,
++            AudioDeviceInfo.TYPE_BLE_BROADCAST,
++            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
++            AudioDeviceInfo.TYPE_WIRED_HEADSET,
++            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
++            AudioDeviceInfo.TYPE_HEARING_AID,
++            AudioDeviceInfo.TYPE_HDMI,
++            AudioDeviceInfo.TYPE_HDMI_ARC,
++            AudioDeviceInfo.TYPE_HDMI_EARC,
++            AudioDeviceInfo.TYPE_LINE_ANALOG,
++            AudioDeviceInfo.TYPE_LINE_DIGITAL,
++            AudioDeviceInfo.TYPE_AUX_LINE,
++            AudioDeviceInfo.TYPE_DOCK,
++    )
++
++    /** Salida activa para musica. */
++    private fun resolve(manager: AudioManager): AudioDeviceInfo? {
++        val attributes = AudioAttributes.Builder()
++                .setUsage(AudioAttributes.USAGE_MEDIA)
++                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
++                .build()
++        val outputs = runCatching {
++            manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
++        }.getOrNull()?.toList().orEmpty()
++        if (outputs.isEmpty()) return null
++        // getDevicesForAttributes devuelve atributos, no AudioDeviceInfo: se busca
++        // el dispositivo real por tipo y direccion.
++        val routed = runCatching {
++            manager.getDevicesForAttributes(attributes)
++        }.getOrNull().orEmpty()
++        for (attribute in routed) {
++            if (!isExternal(attribute.type)) continue
++            val match = outputs.firstOrNull {
++                it.type == attribute.type && it.address == attribute.address
++            }
++            if (match != null) return match
++        }
++        // En reposo el AudioPolicy sigue contestando "altavoz" aunque haya unos
++        // cascos Bluetooth conectados (la ruta de musica solo cambia al empezar a
++        // reproducir). La stock mira el dispositivo conectado, asi que se prefiere
++        // la salida externa si existe: mejor no aplicar la curva del altavoz a unos
++        // cascos que al reves.
++        val connected = outputs
++                .filter { isExternal(it.type) }
++                .minByOrNull { priority.indexOf(it.type).let { i -> if (i < 0) Int.MAX_VALUE else i } }
++        if (connected != null) return connected
++        return outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
++                ?: outputs.first()
++    }
++
++    private fun isExternal(type: Int): Boolean = externalTypes.contains(type)
++
++    /**
++     * Clave estable por dispositivo fisico: Bluetooth por MAC, USB por nombre o
++     * direccion, el cable por tipo (no hay forma de distinguir dos cables).
++     */
++    private fun keyOf(device: AudioDeviceInfo): String = when (device.type) {
++        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> KEY_SPEAKER
++        AudioDeviceInfo.TYPE_WIRED_HEADSET,
++        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired"
++        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
++        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
++        AudioDeviceInfo.TYPE_BLE_HEADSET,
++        AudioDeviceInfo.TYPE_BLE_SPEAKER,
++        AudioDeviceInfo.TYPE_BLE_BROADCAST -> "bt:" + stableId(device, "bt")
++        AudioDeviceInfo.TYPE_USB_DEVICE,
++        AudioDeviceInfo.TYPE_USB_HEADSET,
++        AudioDeviceInfo.TYPE_USB_ACCESSORY -> "usb:" + stableId(device, "usb")
++        AudioDeviceInfo.TYPE_HDMI,
++        AudioDeviceInfo.TYPE_HDMI_ARC,
++        AudioDeviceInfo.TYPE_HDMI_EARC -> "hdmi"
++        AudioDeviceInfo.TYPE_LINE_ANALOG,
++        AudioDeviceInfo.TYPE_LINE_DIGITAL,
++        AudioDeviceInfo.TYPE_AUX_LINE -> "line"
++        AudioDeviceInfo.TYPE_DOCK -> "dock"
++        AudioDeviceInfo.TYPE_HEARING_AID -> "hearing_aid"
++        else -> "type:" + device.type
++    }
++
++    private fun stableId(device: AudioDeviceInfo, fallback: String): String {
++        val address = device.address
++        if (!address.isNullOrBlank() && address != "00:00:00:00:00:00") return address
++        val name = device.productName?.toString()
++        if (!name.isNullOrBlank()) return name
++        return "$fallback-${device.type}"
++    }
++
++    private fun labelOf(context: Context?, device: AudioDeviceInfo): String {
++        val id = device.address?.takeIf {
++            !it.isNullOrBlank() && it != "00:00:00:00:00:00"
++        } ?: device.productName?.toString()?.takeIf { it.isNotBlank() }
++        return when (device.type) {
++            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ->
++                context?.getString(R.string.route_speaker).orEmpty()
++            AudioDeviceInfo.TYPE_WIRED_HEADSET,
++            AudioDeviceInfo.TYPE_WIRED_HEADPHONES ->
++                context?.getString(R.string.route_wired).orEmpty()
++            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
++            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
++            AudioDeviceInfo.TYPE_BLE_HEADSET,
++            AudioDeviceInfo.TYPE_BLE_SPEAKER,
++            AudioDeviceInfo.TYPE_BLE_BROADCAST ->
++                if (id == null) {
++                    context?.getString(R.string.route_bluetooth).orEmpty()
++                } else {
++                    context?.getString(R.string.route_bluetooth_named, id).orEmpty()
++                }
++            AudioDeviceInfo.TYPE_USB_DEVICE,
++            AudioDeviceInfo.TYPE_USB_HEADSET,
++            AudioDeviceInfo.TYPE_USB_ACCESSORY ->
++                if (id == null) {
++                    context?.getString(R.string.route_usb).orEmpty()
++                } else {
++                    context?.getString(R.string.route_usb_named, id).orEmpty()
++                }
++            AudioDeviceInfo.TYPE_HDMI,
++            AudioDeviceInfo.TYPE_HDMI_ARC,
++            AudioDeviceInfo.TYPE_HDMI_EARC ->
++                context?.getString(R.string.route_hdmi).orEmpty()
++            AudioDeviceInfo.TYPE_LINE_ANALOG,
++            AudioDeviceInfo.TYPE_LINE_DIGITAL,
++            AudioDeviceInfo.TYPE_AUX_LINE ->
++                context?.getString(R.string.route_line).orEmpty()
++            else -> device.productName?.toString()?.takeIf { it.isNotBlank() }
++                    ?: context?.getString(R.string.route_other, device.type).orEmpty()
++        }
++    }
++}
+diff --git a/dap/src/org/lineageos/dap/BootCompletedReceiver.kt b/dap/src/org/lineageos/dap/BootCompletedReceiver.kt
+index 594253d..43fc8a8 100644
+--- a/dap/src/org/lineageos/dap/BootCompletedReceiver.kt
++++ b/dap/src/org/lineageos/dap/BootCompletedReceiver.kt
+@@ -20,21 +20,13 @@ import android.content.BroadcastReceiver
+ import android.content.Context
+ import android.content.Intent
+ 
+-import androidx.preference.PreferenceManager
+-
+-import org.lineageos.dap.DolbyFragment.Companion.PREF_DOLBY_ENABLE
+-import org.lineageos.dap.DolbyFragment.Companion.PREF_DOLBY_MODES
+-
+ class BootCompletedReceiver : BroadcastReceiver() {
+ 
+     override fun onReceive(context: Context, intent: Intent) {
+-        val sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context)
+-        for ((key, value) in PREF_DOLBY_MODES) {
+-            if (sharedPrefs.getBoolean(key, false)) {
+-                DolbyCore.setProfile(value)
+-                break
+-            }
+-        }
+-        DolbyCore.setEnabled(sharedPrefs.getBoolean(PREF_DOLBY_ENABLE, false))
++        AudioRoute.init(context)
++        // Dolby primero (deja el 3D coherente y crea su efecto) y luego el
++        // estado de SoundAlive, para que quede cargado en el motor.
++        DolbyFragment.applyDolby(context)
++        DolbyFragment.applySoundAlive(context)
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/dap/src/org/lineageos/dap/DapApplication.kt b/dap/src/org/lineageos/dap/DapApplication.kt
+new file mode 100644
+index 0000000..d10979b
+--- /dev/null
++++ b/dap/src/org/lineageos/dap/DapApplication.kt
+@@ -0,0 +1,33 @@
++/*
++ * Copyright (C) 2022 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.lineageos.dap
++
++import android.app.Application
++
++/**
++ * El proceso es persistente, pero si el sistema lo reinicia no pasa por ningun
++ * receiver ni por la actividad: sin inicializar aqui, el callback de dispositivos
++ * de audio no se registra hasta que se abre una sesion de reproduccion, y mientras
++ * tanto un cambio a Bluetooth o cascos no se detecta.
++ */
++class DapApplication : Application() {
++
++    override fun onCreate() {
++        super.onCreate()
++        AudioRoute.init(this)
++    }
++}
+diff --git a/dap/src/org/lineageos/dap/DeviceState.kt b/dap/src/org/lineageos/dap/DeviceState.kt
+new file mode 100644
+index 0000000..c6b9bcd
+--- /dev/null
++++ b/dap/src/org/lineageos/dap/DeviceState.kt
+@@ -0,0 +1,96 @@
++/*
++ * Copyright (C) 2022 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.lineageos.dap
++
++import android.content.Context
++import android.content.SharedPreferences
++
++import androidx.preference.PreferenceManager
++
++/**
++ * Preferencias por dispositivo de salida.
++ *
++ * Cada salida (altavoz, cable, cada auricular Bluetooth por su MAC, USB...) tiene
++ * su propio fichero de preferencias. Asi el ajuste del altavoz no se pierde al
++ * conectar cascos y cada dispositivo recuerda lo que se le puso.
++ *
++ * Valores por defecto: en el altavoz SoundAlive va encendido (alli la curva stock
++ * se aplica siempre, con el interruptor encendido o apagado); en cualquier otra
++ * salida SoundAlive y Dolby van apagados.
++ */
++object DeviceState {
++    const val FILE_PREFIX = "dap_dev_"
++
++    private const val LEGACY_MIGRATED = "device_state_migrated"
++
++    /**
++     * Todo va en almacenamiento device-protected. El receptor de arranque aplica el
++     * estado antes de desbloquear (su contexto es device-protected) y el panel tiene
++     * que leer y escribir exactamente el mismo fichero; si no, cada uno usa uno.
++     */
++    private fun deviceContext(context: Context): Context =
++            context.createDeviceProtectedStorageContext()
++
++    fun prefs(context: Context): SharedPreferences =
++            prefs(context, AudioRoute.currentKey())
++
++    private fun prefs(context: Context, key: String): SharedPreferences =
++            deviceContext(context).getSharedPreferences(
++                    FILE_PREFIX + sanitize(key), Context.MODE_PRIVATE)
++
++    /** Default de SoundAlive: encendido solo en el altavoz. */
++    fun soundAliveDefault(): Boolean = AudioRoute.isSpeaker()
++
++    /**
++     * Las preferencias globales de antes (una sola configuracion para todo) pasan
++     * a ser las del altavoz. Solo se hace una vez y sin pisar nada ya guardado.
++     *
++     * Se miran las dos ubicaciones porque versiones anteriores escribian desde el
++     * arranque (device-protected) y desde el panel (credential-encrypted): lo que
++     * hubiera en cada una se copia, y lo de credential-encrypted manda si hay algo.
++     */
++    fun migrateLegacy(context: Context) {
++        val legacyDe = PreferenceManager.getDefaultSharedPreferences(deviceContext(context))
++        val legacyCe = PreferenceManager.getDefaultSharedPreferences(context)
++        if (legacyDe.getBoolean(LEGACY_MIGRATED, false)) return
++        val speaker = prefs(context, AudioRoute.KEY_SPEAKER)
++        if (speaker.all.isEmpty()) {
++            val editor = speaker.edit()
++            copyInto(editor, legacyDe)
++            copyInto(editor, legacyCe)
++            editor.apply()
++        }
++        legacyDe.edit().putBoolean(LEGACY_MIGRATED, true).apply()
++        legacyCe.edit().putBoolean(LEGACY_MIGRATED, true).apply()
++    }
++
++    private fun copyInto(editor: SharedPreferences.Editor, from: SharedPreferences) {
++        from.all.forEach { (name, value) ->
++            when (value) {
++                is Boolean -> editor.putBoolean(name, value)
++                is Int -> editor.putInt(name, value)
++                is Long -> editor.putLong(name, value)
++                is Float -> editor.putFloat(name, value)
++                is String -> editor.putString(name, value)
++            }
++        }
++    }
++
++    /** El nombre del fichero no admite ':' ni espacios (MAC, nombre de USB). */
++    private fun sanitize(key: String): String =
++            key.replace(Regex("[^A-Za-z0-9._-]"), "_")
++}
+diff --git a/dap/src/org/lineageos/dap/DolbyActivity.kt b/dap/src/org/lineageos/dap/DolbyActivity.kt
+index 18dcdc1..619c51e 100644
+--- a/dap/src/org/lineageos/dap/DolbyActivity.kt
++++ b/dap/src/org/lineageos/dap/DolbyActivity.kt
+@@ -19,12 +19,13 @@ package org.lineageos.dap
+ import android.os.Bundle
+ 
+ import com.android.settingslib.collapsingtoolbar.CollapsingToolbarBaseActivity
++import com.android.settingslib.collapsingtoolbar.R
+ 
+ class DolbyActivity : CollapsingToolbarBaseActivity() {
+     public override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+-        supportFragmentManager.beginTransaction().replace(
+-                com.android.settingslib.collapsingtoolbar.R.id.content_frame,
++        fragmentManager.beginTransaction().replace(
++                R.id.content_frame,
+                 DolbyFragment()
+         ).commit()
+     }
+diff --git a/dap/src/org/lineageos/dap/DolbyCore.kt b/dap/src/org/lineageos/dap/DolbyCore.kt
+index b287f18..2d4688a 100644
+--- a/dap/src/org/lineageos/dap/DolbyCore.kt
++++ b/dap/src/org/lineageos/dap/DolbyCore.kt
+@@ -16,56 +16,180 @@
+ 
+ package org.lineageos.dap
+ 
+-import android.content.Context
+ import android.media.audiofx.AudioEffect
+-
+-import org.lineageos.dap.DolbyFragment.Companion.PREF_DOLBY_MODES
++import android.util.Log
+ 
+ import java.util.UUID
+ 
++/**
++ * Motor Dolby real de la tablet (libswdap.so, el mismo que usa la stock).
++ *
++ * Se carga en el proceso android.hardware.audio.service y solo procesa cuando se
++ * le manda un perfil: con el perfil por defecto (-1) todos los parametros internos
++ * quedan a 0 y no se oye ninguna diferencia. Por eso durante mucho tiempo parecio
++ * que Dolby "no hacia nada".
++ *
++ *   - Perfil:   setParameter(0, id)  <-- esto es lo que arranca el procesado
++ *   - Apagado:  no basta setParameter(19, 0) (no llega a setEnabled(false) del
++ *               motor), asi que se manda el perfil Off y se libera el efecto.
++ *
++ * Los ids salen de dax-default.xml del propio dispositivo:
++ *   0 Dynamic (Auto) | 1 Movie | 2 Music | 3 Voice | 4 Game
++ *   5 Off | 6 Game1 | 7 Game2 | 8 SpacialAudio
++ *
++ * En la app de Samsung de la stock el panel Dolby Atmos tenia exactamente estos
++ * cuatro niveles (Auto/Movie/Music/Voice) mas el interruptor para juegos, asi que
++ * "Auto" es el perfil Dynamic, que es el que lleva el ecualizador inteligente
++ * activado (ieon=1, iea=3).
++ */
+ object DolbyCore {
+-    private const val EFFECT_PARAM_PROFILE = 0
+-    private const val EFFECT_PARAM_EFF_ENAB = 19
++    // Tipos de Dolby, en orden de preferencia: el que expone el HAL de Samsung
++    // (46d279d9, DAX3) y los genericos de libswdap.
++    private val EFFECT_TYPES_DAP = listOf(
++            UUID.fromString("46d279d9-9be7-453d-9d7c-ef937f675587"),
++            UUID.fromString("6ab06da4-c516-4611-8166-452799218539"),
++            UUID.fromString("9d4921da-8225-4f29-aefa-39537a04bcaa"))
+ 
+-    private val EFFECT_TYPE_DAP = UUID.fromString("46d279d9-9be7-453d-9d7c-ef937f675587")
++    private const val PARAM_PROFILE = 0
+ 
++    private const val PROFILE_OFF = 5
++    private const val MAX_SESSIONS = 8
++
++    /** Niveles del panel de stock, en el orden en que los muestra. */
+     const val PROFILE_AUTO = 0
+     const val PROFILE_MOVIE = 1
+     const val PROFILE_MUSIC = 2
+     const val PROFILE_VOICE = 3
+     const val PROFILE_GAME = 4
+-    const val PROFILE_OFF = 5
+-    const val PROFILE_GAME_1 = 6
+-    const val PROFILE_GAME_2 = 7
+-    const val PROFILE_SPACIAL_AUDIO = 8
+-
+-    private val audioEffect = runCatching {
+-        AudioEffect(EFFECT_TYPE_DAP, AudioEffect.EFFECT_TYPE_NULL, 0, 0)
+-    }.getOrNull()
+-
+-    fun getProfile(): Int {
+-        val out = intArrayOf(PROFILE_AUTO)
+-        audioEffect?.getParameter(EFFECT_PARAM_PROFILE, out)
+-        return out.first().coerceIn(PROFILE_AUTO, PROFILE_SPACIAL_AUDIO)
++
++    val PROFILES: Map<String, Int> = linkedMapOf(
++            "auto" to PROFILE_AUTO,
++            "movie" to PROFILE_MOVIE,
++            "music" to PROFILE_MUSIC,
++            "voice" to PROFILE_VOICE,
++    )
++
++    private const val GLOBAL_SESSION = 0
++
++    private val sessions = LinkedHashSet<Int>()
++    private val effects = LinkedHashMap<Int, AudioEffect>()
++
++    private var enabled = false
++    // Solo altavoz: con cascos/USB/Bluetooth no debe colorear nada.
++    private var speakerRoute = true
++    private var profile = PROFILE_AUTO
++    private var game = false
++
++    /** Perfil que hay que mandar al motor: el de juegos manda si esta activo. */
++    private fun activeProfile() = if (game) PROFILE_GAME else profile
++
++    @Synchronized
++    fun addSession(sessionId: Int) {
++        if (sessionId <= 0) return
++        if (!sessions.contains(sessionId) && sessions.size >= MAX_SESSIONS) {
++            val oldest = sessions.first()
++            sessions.remove(oldest)
++            releaseSession(oldest)
++        }
++        sessions.add(sessionId)
++        if (!enabled || !speakerRoute) return
++        createFor(sessionId)
++    }
++
++    @Synchronized
++    fun removeSession(sessionId: Int) {
++        sessions.remove(sessionId)
++        releaseSession(sessionId)
++    }
++
++    /** Cambio de salida: fuera del altavoz Dolby se suelta entero. */
++    @Synchronized
++    fun setRoute(isSpeaker: Boolean) {
++        if (speakerRoute == isSpeaker) return
++        speakerRoute = isSpeaker
++        if (!speakerRoute) {
++            effects.keys.toList().forEach { releaseSession(it) }
++            return
++        }
++        if (!enabled) return
++        sessions.add(GLOBAL_SESSION)
++        sessions.toList().forEach { createFor(it) }
++        applyProfile()
++    }
++
++    @Synchronized
++    fun setEnabled(value: Boolean) {
++        enabled = value
++        if (value && speakerRoute) {
++            // La sesion 0 es la salida global: Dolby tiene que ir ahi para sonar
++            // sin depender de que el reproductor abra sesion.
++            sessions.add(GLOBAL_SESSION)
++            sessions.toList().forEach { createFor(it) }
++            // Reenviar el perfil a las sesiones que ya tenian efecto: si solo se
++            // cambia el interruptor, createFor sale antes y el motor se queda sin
++            // perfil (inaudible).
++            applyProfile()
++        } else {
++            effects.keys.toList().forEach { releaseSession(it) }
++        }
++    }
++
++    @Synchronized
++    fun isEnabled() = enabled
++
++    @Synchronized
++    fun setProfile(name: String) {
++        val id = PROFILES[name] ?: return
++        profile = id
++        applyProfile()
+     }
+ 
+-    fun getProfileName(context: Context): String {
+-        val profile = getProfile()
+-        val resourceName = PREF_DOLBY_MODES.filter { it.value == profile }.keys.first()
++    @Synchronized
++    fun currentProfile(): String =
++            PROFILES.entries.firstOrNull { it.value == profile }?.key ?: "auto"
+ 
+-        return context.resources.getString(context.resources.getIdentifier(
+-                resourceName, "string", context.packageName
+-        ))
++    @Synchronized
++    fun setGame(value: Boolean) {
++        if (game == value) return
++        game = value
++        applyProfile()
+     }
+ 
+-    fun setProfile(profile: Int) {
+-        audioEffect?.setParameter(EFFECT_PARAM_EFF_ENAB, 1)
+-        audioEffect?.setParameter(EFFECT_PARAM_PROFILE, profile)
++    @Synchronized
++    fun isGame() = game
++
++    private fun applyProfile() {
++        if (!enabled) return
++        val id = activeProfile()
++        effects.values.forEach { runCatching { it.setParameter(PARAM_PROFILE, id) } }
+     }
+ 
+-    fun setEnabled(enabled: Boolean) {
+-        audioEffect?.enabled = enabled
++    private fun createFor(sessionId: Int) {
++        if (!speakerRoute) return
++        if (effects.containsKey(sessionId)) return
++        var effect: AudioEffect? = null
++        for (uuid in EFFECT_TYPES_DAP) {
++            effect = runCatching {
++                AudioEffect(uuid, AudioEffect.EFFECT_TYPE_NULL, 0, sessionId)
++            }.onFailure {
++                Log.w("SamsungDAP", "Dolby: $uuid no disponible en la sesion $sessionId", it)
++            }.getOrNull()
++            if (effect != null) {
++                Log.i("SamsungDAP", "Dolby: efecto $uuid en la sesion $sessionId")
++                break
++            }
++        }
++        val created = effect ?: return
++        effects[sessionId] = created
++        runCatching { if (!created.enabled) created.enabled = true }
++        runCatching { created.setParameter(PARAM_PROFILE, activeProfile()) }
+     }
+ 
+-    fun isEnabled() = audioEffect?.enabled ?: false
++    private fun releaseSession(sessionId: Int) {
++        effects.remove(sessionId)?.let { effect ->
++            // Perfil Off antes de soltar el efecto, para que el motor vuelva a bypass.
++            runCatching { effect.setParameter(PARAM_PROFILE, PROFILE_OFF) }
++            runCatching { effect.release() }
++        }
++    }
+ }
+diff --git a/dap/src/org/lineageos/dap/DolbyFragment.kt b/dap/src/org/lineageos/dap/DolbyFragment.kt
+index d577834..df57f06 100644
+--- a/dap/src/org/lineageos/dap/DolbyFragment.kt
++++ b/dap/src/org/lineageos/dap/DolbyFragment.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2022-2024 The LineageOS Project
++ * Copyright (C) 2022 The LineageOS Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -16,63 +16,346 @@
+ 
+ package org.lineageos.dap
+ 
++import android.content.Context
+ import android.os.Bundle
+-import android.widget.CompoundButton
+-import android.widget.CompoundButton.OnCheckedChangeListener
+ 
+-import androidx.preference.PreferenceFragmentCompat
++import androidx.preference.PreferenceFragment
++import androidx.preference.SwitchPreference
+ 
+ import com.android.settingslib.widget.MainSwitchPreference
+ import com.android.settingslib.widget.SelectorWithWidgetPreference
+ 
+ import org.lineageos.dap.R
+ 
+-class DolbyFragment : PreferenceFragmentCompat(), OnCheckedChangeListener {
++/**
++ * Panel de SoundAlive: perfiles (propios y de Samsung) y "Personalizado", que es
++ * el unico modo en el que las barras del ecualizador se pueden tocar. Debajo, los
++ * dos extras que se pueden activar de verdad: 3D (efecto MySpace aparte) y
++ * amplificador de valvulas (mGlobalTubeAmp del motor).
++ */
++class DolbyFragment : PreferenceFragment() {
++
++    private var soundAliveSwitch: MainSwitchPreference? = null
++    private lateinit var dolbySwitch: SwitchPreference
++    private var equalizer: EqualizerPreference? = null
+ 
+-    private lateinit var switchBar: MainSwitchPreference
++    /** Evita que los cambios programaticos del interruptor se traten como del usuario. */
++    private var updatingSwitches = false
+ 
+     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+-        setPreferencesFromResource(R.xml.dolby_settings, rootKey)
++        addPreferencesFromResource(R.xml.dolby_settings)
++
++        val context = contextOrActivity()
++        AudioRoute.init(context)
++        migrateIfNeeded(context)
++
++        soundAliveSwitch = findPreference<MainSwitchPreference>(PREF_SA_ENABLE)
++        equalizer = findPreference<EqualizerPreference>(PREF_SA_EQUALIZER)
++        soundAliveSwitch?.let { switch ->
++            switch.isChecked = prefs(context).getBoolean(
++                    PREF_SA_ENABLE, DeviceState.soundAliveDefault())
++            switch.addOnSwitchChangeListener { _, isChecked ->
++                // Los cambios programaticos tambien llegan aqui (el MainSwitchBar
++                // propaga). Se ignoran para no reaplicar dos veces con valores viejos.
++                if (updatingSwitches) return@addOnSwitchChangeListener
++                prefs(context).edit().putBoolean(PREF_SA_ENABLE, isChecked).apply()
++                applySoundAlive(context)
++                updateUi(context)
++            }
++        }
++        equalizer?.let { eq -> eq.onValuesChanged = { values -> onValuesChanged(values) } }
++
++        for (name in SoundAliveCore.PRESET_NAMES) {
++            findPreference<SelectorWithWidgetPreference>(presetKey(name))
++                    ?.setOnPreferenceClickListener {
++                        applyPreset(name)
++                        true
++                    }
++        }
+ 
+-        switchBar = findPreference<MainSwitchPreference>(PREF_DOLBY_ENABLE)!!
+-        switchBar.addOnSwitchChangeListener(this)
+-        switchBar.isChecked = DolbyCore.isEnabled()
++        bindSwitch(PREF_SA_SURROUND, false) { SoundAliveCore.setSurround(it) }
++        bindSwitch(PREF_SA_TUBE_AMP, false) { SoundAliveCore.setTubeAmp(it) }
+ 
+-        for ((key, value) in PREF_DOLBY_MODES) {
+-            val preference = findPreference<SelectorWithWidgetPreference>(key)!!
+-            preference.setOnPreferenceClickListener {
+-                setProfile(value)
++        bindDolby(context)
++
++        applyDolby(context)
++        // La EQ no se aplica: sin panel no hay curva que valga. Solo Dolby.
++        SoundAliveCore.setEnabled(false)
++        equalizer?.setValues(getOffsets(context))
++        updateUi(context)
++        updateDolbyUi(context)
++    }
++
++    /**
++     * Con el panel abierto se puede cambiar de salida (enchufar cascos), asi que se
++     * recarga lo que ese dispositivo tiene guardado.
++     */
++    override fun onResume() {
++        super.onResume()
++        AudioRoute.setListener { _, _ ->
++            val context = contextOrActivity()
++            equalizer?.setValues(getOffsets(context))
++            updateUi(context)
++            updateDolbyUi(context)
++        }
++    }
++    override fun onPause() {
++        super.onPause()
++        AudioRoute.setListener(null)
++    }
++
++    /** Dolby Atmos como en la stock: interruptor + los cuatro niveles del panel. */
++    private fun bindDolby(context: Context) {
++        dolbySwitch = findPreference<SwitchPreference>(PREF_DOLBY_ENABLE)!!
++        dolbySwitch.isChecked = prefs(context).getBoolean(PREF_DOLBY_ENABLE, false)
++        dolbySwitch.setOnPreferenceChangeListener { _, newValue ->
++            prefs(context).edit().putBoolean(PREF_DOLBY_ENABLE, newValue as Boolean).apply()
++            applyDolby(context)
++            updateDolbyUi(context)
++            updateUi(context)
++            true
++        }
++
++        for (name in DolbyCore.PROFILES.keys) {
++            findPreference<SelectorWithWidgetPreference>(dolbyKey(name))?.setOnPreferenceClickListener {
++                // Elegir un nivel apaga el modo juegos: si no, el motor seguiria
++                // usando el perfil Game y el nivel elegido no se oiria.
++                prefs(context).edit()
++                        .putString(PREF_DOLBY_PROFILE, name)
++                        .putBoolean(PREF_DOLBY_ENABLE, true)
++                        .putBoolean(PREF_DOLBY_GAME, false)
++                        .apply()
++                findPreference<SwitchPreference>(PREF_DOLBY_GAME)?.isChecked = false
++                dolbySwitch.isChecked = true
++                applyDolby(context)
++                updateDolbyUi(context)
++                updateUi(context)
+                 true
+             }
+         }
++
++        bindSwitch(PREF_DOLBY_GAME, false) {
++            DolbyCore.setGame(it)
++            updateDolbyUi(context)
++        }
++    }
++
++    /** Pone el interruptor sin disparar el listener (ya lo hace quien llama). */
++    private fun setSoundAliveSwitch(value: Boolean) {
++        if (soundAliveSwitch?.isChecked == value) return
++        updatingSwitches = true
++        soundAliveSwitch?.isChecked = value
++        updatingSwitches = false
++    }
++
++    private fun bindSwitch(key: String, initial: Boolean, onChange: (Boolean) -> Unit) {
++        val context = contextOrActivity()
++        findPreference<SwitchPreference>(key)?.apply {
++            isChecked = prefs(context).getBoolean(key, initial)
++            setOnPreferenceChangeListener { _, newValue ->
++                prefs(context).edit().putBoolean(key, newValue as Boolean).apply()
++                onChange(newValue as Boolean)
++                true
++            }
++        }
++    }
++
++    private fun onValuesChanged(values: IntArray) {
++        val context = contextOrActivity()
++        val editor = prefs(context).edit()
++        for (band in 0 until SoundAliveCore.BANDS) {
++            editor.putInt(bandKey(band), values[band])
++        }
++        editor.putString(PREF_SA_PRESET, SoundAliveCore.PRESET_CUSTOM)
++        editor.apply()
++
++        val wasCustom = SoundAliveCore.currentPreset() == SoundAliveCore.PRESET_CUSTOM
++        if (!wasCustom) SoundAliveCore.setPresetName(SoundAliveCore.PRESET_CUSTOM)
++        SoundAliveCore.setOffsets(values)
++        // Las barras se mueven muchas veces por segundo: solo se refresca la lista
++        // cuando de verdad cambia el perfil seleccionado.
++        if (!wasCustom) updateUi(context)
++    }
++
++    private fun applyPreset(name: String) {
++        val context = contextOrActivity()
++        val curve = SoundAliveCore.PRESETS[name]
++        // Los valores se guardan ANTES de tocar el interruptor: si se hiciera al
++        // reves, el listener aplicaria la curva vieja y luego la nueva (glitch).
++        prefs(context).edit()
++                .putString(PREF_SA_PRESET, name)
++                .putBoolean(PREF_SA_ENABLE, true)
++                .apply()
++        if (curve != null) persistOffsets(context, curve)
++
++        setSoundAliveSwitch(true)
++        SoundAliveCore.setEnabled(true)
++        SoundAliveCore.setPreset(name)
++        if (curve != null) equalizer?.setValues(curve)
++        updateUi(context)
+     }
+ 
+-    override fun onCheckedChanged(buttonView: CompoundButton, isChecked: Boolean) {
+-        DolbyCore.setEnabled(isChecked)
++    private fun persistOffsets(context: Context, values: IntArray) {
++        val editor = prefs(context).edit()
++        for (band in 0 until SoundAliveCore.BANDS) {
++            editor.putInt(bandKey(band), values[band])
++        }
++        editor.apply()
+     }
+ 
+-    private fun setProfile(profile: Int) {
+-        DolbyCore.setProfile(profile)
++    private fun updateUi(context: Context) {
++        val speaker = AudioRoute.isSpeaker()
++        val current = getPreset(context)
++        for (name in SoundAliveCore.PRESET_NAMES) {
++            findPreference<SelectorWithWidgetPreference>(presetKey(name))?.apply {
++                isChecked = name == current
++                isEnabled = speaker
++            }
++        }
++        // Fuera del altavoz SoundAlive no actua: interruptor apagado y bloqueado,
++        // perfiles bloqueados y la fila de salida lo dice.
++        val sa = speaker && prefs(context).getBoolean(
++                PREF_SA_ENABLE, DeviceState.soundAliveDefault())
++        soundAliveSwitch?.isEnabled = speaker
++        setSoundAliveSwitch(sa)
++        findPreference<androidx.preference.Preference>(PREF_DEVICE)?.summary =
++                if (speaker) {
++                    AudioRoute.currentLabel()
++                } else {
++                    context.getString(R.string.soundalive_only_speaker_summary,
++                            AudioRoute.currentLabel())
++                }
++        equalizer?.setEditable(speaker && current == SoundAliveCore.PRESET_CUSTOM && sa)
++        // 3D y valvulas solo tienen sentido con SoundAlive encendido, y el 3D
++        // tampoco convive con Dolby (la stock lo desactiva).
++        val dolby = prefs(context).getBoolean(PREF_DOLBY_ENABLE, false)
++        findPreference<SwitchPreference>(PREF_SA_SURROUND)?.apply {
++            if (dolby || !speaker) isChecked = false
++            isEnabled = speaker && sa && !dolby
++        }
++        findPreference<SwitchPreference>(PREF_SA_TUBE_AMP)?.isEnabled = speaker && sa
++    }
+ 
+-        for ((key, value) in PREF_DOLBY_MODES) {
+-            val preference = findPreference<SelectorWithWidgetPreference>(key)!!
+-            preference.isChecked = value == profile
++    private fun updateDolbyUi(context: Context) {
++        val on = prefs(context).getBoolean(PREF_DOLBY_ENABLE, false)
++        val game = prefs(context).getBoolean(PREF_DOLBY_GAME, false)
++        dolbySwitch.isChecked = on
++        val current = getDolbyProfile(context)
++        for (name in DolbyCore.PROFILES.keys) {
++            findPreference<SelectorWithWidgetPreference>(dolbyKey(name))?.apply {
++                isChecked = on && name == current
++                // Con el modo juegos activo el motor usa el perfil Game, asi que
++                // los niveles no se pueden tocar (se quedaria marcado uno que no suena).
++                isEnabled = on && !game
++            }
+         }
++        findPreference<SwitchPreference>(PREF_DOLBY_GAME)?.isEnabled = on
++        // El ecualizador solo tiene sentido (y solo se ve) con Dolby encendido.
++        findPreference<androidx.preference.PreferenceCategory>("eq_category")?.isVisible = on
+     }
+ 
++    private fun contextOrActivity(): Context = activity ?: context
++
+     companion object {
++        const val PREF_SA_ENABLE = "soundalive_enable"
++        const val PREF_SA_EQUALIZER = "soundalive_equalizer"
++        const val PREF_SA_PRESET = "soundalive_preset"
++        const val PREF_SA_SURROUND = "soundalive_surround"
++        const val PREF_SA_TUBE_AMP = "soundalive_tube_amp"
++        const val PREF_DEVICE = "soundalive_device"
++
+         const val PREF_DOLBY_ENABLE = "dolby_enable"
++        const val PREF_DOLBY_PROFILE = "dolby_profile"
++        const val PREF_DOLBY_GAME = "dolby_game"
++
++        private const val PREF_SA_VERSION = "soundalive_eq_version"
++        private const val EQ_VERSION = 7
++
++        fun bandKey(band: Int) = "soundalive_band_$band"
+ 
+-        val PREF_DOLBY_MODES = mapOf(
+-                "dolby_profile_auto" to DolbyCore.PROFILE_AUTO,
+-                "dolby_profile_movie" to DolbyCore.PROFILE_MOVIE,
+-                "dolby_profile_music" to DolbyCore.PROFILE_MUSIC,
+-                "dolby_profile_voice" to DolbyCore.PROFILE_VOICE,
+-                "dolby_profile_game" to DolbyCore.PROFILE_GAME,
+-                "dolby_profile_off" to DolbyCore.PROFILE_OFF,
+-                "dolby_profile_game_1" to DolbyCore.PROFILE_GAME_1,
+-                "dolby_profile_game_2" to DolbyCore.PROFILE_GAME_2,
+-                "dolby_profile_spacial_audio" to DolbyCore.PROFILE_SPACIAL_AUDIO,
+-        )
++        fun presetKey(name: String) = "soundalive_preset_$name"
++
++        fun dolbyKey(name: String) = "dolby_profile_$name"
++
++        private fun prefs(context: Context) =
++                DeviceState.prefs(context)
++
++        fun getOffsets(context: Context): IntArray {
++            val stored = prefs(context)
++            if (stored.getInt(PREF_SA_VERSION, 0) != EQ_VERSION) {
++                return SoundAliveCore.PRESETS.getValue(SoundAliveCore.PRESET_DEFAULT).copyOf()
++            }
++            return IntArray(SoundAliveCore.BANDS) { band ->
++                stored.getInt(bandKey(band), 0)
++                        .coerceIn(SoundAliveCore.MIN_LEVEL, SoundAliveCore.MAX_LEVEL)
++            }
++        }
++
++        fun getPreset(context: Context): String {
++            val name = prefs(context).getString(PREF_SA_PRESET, SoundAliveCore.PRESET_DEFAULT)
++            return if (name != null && SoundAliveCore.PRESET_NAMES.contains(name)) {
++                name
++            } else {
++                SoundAliveCore.PRESET_DEFAULT
++            }
++        }
++
++        fun migrateIfNeeded(context: Context) {
++            val stored = prefs(context)
++            if (stored.getInt(PREF_SA_VERSION, 0) == EQ_VERSION) return
++            val editor = stored.edit()
++            val curve = SoundAliveCore.PRESETS.getValue(SoundAliveCore.PRESET_DEFAULT)
++            for (band in 0 until SoundAliveCore.BANDS) {
++                editor.putInt(bandKey(band), curve[band])
++            }
++            editor.putInt(PREF_SA_VERSION, EQ_VERSION)
++            editor.apply()
++        }
++
++        fun applySoundAlive(context: Context) {
++            val stored = prefs(context)
++            // La EQ solo actua con Dolby encendido: sin Dolby no se crea ninguna
++            // instancia y el altavoz se queda con el audio tal cual.
++            val dolby = stored.getBoolean(PREF_DOLBY_ENABLE, false)
++            SoundAliveCore.setEnabled(dolby &&
++                    stored.getBoolean(PREF_SA_ENABLE, DeviceState.soundAliveDefault()))
++            SoundAliveCore.setPreset(getPreset(context))
++            SoundAliveCore.setOffsets(getOffsets(context))
++            SoundAliveCore.setSurround(stored.getBoolean(PREF_SA_SURROUND, false))
++            SoundAliveCore.setTubeAmp(stored.getBoolean(PREF_SA_TUBE_AMP, false))
++        }
++
++        fun getDolbyProfile(context: Context): String {
++            val name = prefs(context).getString(PREF_DOLBY_PROFILE, "auto")
++            return if (name != null && DolbyCore.PROFILES.containsKey(name)) name else "auto"
++        }
++
++        /** Perfil y modo de juegos primero, luego el encendido (el perfil arranca el DSP). */
++        /**
++         * Perfil y modo de juegos primero, luego el encendido. Al final se rehace
++         * SIEMPRE nuestra EQ: crear o quitar un efecto en la sesion 0 hace que
++         * AudioFlinger reconstruya la cadena y el que ya estaba se queda fuera
++         * (se notaba en que el DSP no volvia hasta darle a pause/play).
++         */
++        fun applyDolby(context: Context) {
++            val stored = prefs(context)
++            val on = stored.getBoolean(PREF_DOLBY_ENABLE, false)
++            if (on) {
++                // El 3D va aparte (MySpace) y con Dolby activo no tiene sentido.
++                if (stored.getBoolean(PREF_SA_SURROUND, false)) {
++                    stored.edit().putBoolean(PREF_SA_SURROUND, false).apply()
++                }
++                SoundAliveCore.setSurround(false)
++                DolbyCore.setProfile(getDolbyProfile(context))
++                DolbyCore.setGame(stored.getBoolean(PREF_DOLBY_GAME, false))
++            }
++            // Solo se reengancha nuestra curva cuando Dolby cambia de estado: si se
++            // rehiciera en cada cambio de perfil, el efecto se recreaba y su
++            // posicion en la cadena bailaba respecto a Dolby (sonaba distinto cada
++            // vez que tocabas un perfil).
++            DolbyCore.setEnabled(on)
++            // La EQ sigue a Dolby: se aplica o se suelta con el.
++            applySoundAlive(context)
++        }
+     }
+ }
+diff --git a/dap/src/org/lineageos/dap/DolbyTile.kt b/dap/src/org/lineageos/dap/DolbyTile.kt
+index 473ef16..5c5456a 100644
+--- a/dap/src/org/lineageos/dap/DolbyTile.kt
++++ b/dap/src/org/lineageos/dap/DolbyTile.kt
+@@ -19,30 +19,65 @@ package org.lineageos.dap
+ import android.service.quicksettings.Tile
+ import android.service.quicksettings.TileService
+ 
+-import androidx.preference.PreferenceManager
+-
+-import org.lineageos.dap.DolbyFragment.Companion.PREF_DOLBY_ENABLE
++import org.lineageos.dap.DolbyFragment.Companion.PREF_SA_ENABLE
+ 
+ class DolbyTile : TileService() {
+-    private var isEnabled = false
+-        set(value) {
+-            field = value
+-            qsTile.state = if (value) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+-            qsTile.subtitle = DolbyCore.getProfileName(this)
+-            qsTile.updateTile()
++
++    /**
++     * El estado se lee del preference del dispositivo activo, no del motor: tras
++     * reiniciar el proceso el motor arranca con sus valores por defecto y el tile
++     * ensenaria "activo" aunque en los ajustes este apagado.
++     */
++    private fun currentEnabled(): Boolean {
++        AudioRoute.init(this)
++        if (!AudioRoute.isSpeaker()) return false
++        return DeviceState.prefs(this)
++                .getBoolean(PREF_SA_ENABLE, DeviceState.soundAliveDefault())
++    }
++
++    private fun refreshTile() {
++        AudioRoute.init(this)
++        val tile = qsTile ?: return
++        if (!AudioRoute.isSpeaker()) {
++            tile.state = Tile.STATE_UNAVAILABLE
++            tile.subtitle = getString(R.string.soundalive_only_speaker)
++            tile.updateTile()
++            return
+         }
++        val enabled = currentEnabled()
++        tile.state = if (enabled) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
++        tile.subtitle = profileName()
++        tile.updateTile()
++    }
+ 
+     override fun onStartListening() {
+         super.onStartListening()
+-        isEnabled = DolbyCore.isEnabled()
++        refreshTile()
+     }
+ 
+     override fun onClick() {
+-        isEnabled = !isEnabled
+-        DolbyCore.setEnabled(isEnabled)
+-        PreferenceManager.getDefaultSharedPreferences(this)
++        if (!AudioRoute.isSpeaker()) return
++        val enabled = !currentEnabled()
++        // El preference se guarda ANTES de aplicar: applySoundAlive lo lee.
++        DeviceState.prefs(this)
+                 .edit()
+-                .putBoolean(PREF_DOLBY_ENABLE, isEnabled)
++                .putBoolean(PREF_SA_ENABLE, enabled)
+                 .commit()
++        DolbyFragment.applySoundAlive(this)
++        refreshTile()
++    }
++
++    private fun profileName(): String =
++            getString(labelFor(DolbyFragment.getPreset(this)))
++
++    private fun labelFor(name: String) = when (name) {
++        "bass" -> R.string.soundalive_preset_bass
++        "bass_max" -> R.string.soundalive_preset_bass_max
++        "sa_pop" -> R.string.soundalive_preset_sa_pop
++        "sa_classic" -> R.string.soundalive_preset_sa_classic
++        "sa_jazz" -> R.string.soundalive_preset_sa_jazz
++        "sa_rock" -> R.string.soundalive_preset_sa_rock
++        "custom" -> R.string.soundalive_preset_custom
++        else -> R.string.soundalive_preset_neutral
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/dap/src/org/lineageos/dap/EffectSessionReceiver.kt b/dap/src/org/lineageos/dap/EffectSessionReceiver.kt
+new file mode 100755
+index 0000000..28c54c7
+--- /dev/null
++++ b/dap/src/org/lineageos/dap/EffectSessionReceiver.kt
+@@ -0,0 +1,131 @@
++/*
++ * Copyright (C) 2022 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.lineageos.dap
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.media.audiofx.AudioEffect
++import android.util.Log
++
++/**
++ * Recibe la sesion de audio que abre cada reproductor (Spotify, YouTube, ...) y
++ * aplica la ecualizacion a esa sesion concreta. Es el mismo mecanismo que usa
++ * MusicFX: el reproductor emite OPEN_AUDIO_EFFECT_CONTROL_SESSION con
++ * EXTRA_AUDIO_SESSION y el sistema reenvia el intent al primer receptor que
++ * declare la accion (AudioService#handleAudioEffectBroadcast).
++ */
++class EffectSessionReceiver : BroadcastReceiver() {
++
++    override fun onReceive(context: Context, intent: Intent) {
++        if (intent.action == ACTION_PROBE) {
++            probe(intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0))
++            return
++        }
++        if (intent.action == ACTION_TESTPLAY) {
++            testPlay(context)
++            return
++        }
++        val session = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0)
++        Log.i(TAG, "${intent.action} session=$session")
++
++        when (intent.action) {
++            AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> {
++                if (session <= 0) return
++                AudioRoute.init(context)
++                // El estado se carga ANTES de crear el efecto: si no, el motor
++                // arranca con los valores por defecto y se oye un salto (la curva
++                // del perfil anterior o la base sin el ecualizador).
++                // No se crea una instancia por sesion: la curva vive en la sesion
++                // global (0). Si se creara en las dos, el audio del reproductor
++                // pasaria por el efecto dos veces (sonaba distinto segun la app).
++                DolbyFragment.applySoundAlive(context)
++            }
++            AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> {
++                // Nada que soltar: no hay instancia por sesion.
++            }
++        }
++    }
++
++    /** Sonda de diagnostico: prueba que tipos de efecto existen de verdad. */
++    private fun probe(session: Int) {
++        val types = linkedMapOf(
++                "equalizer" to "c8e70ecd-48ca-456e-8a4f-0002a5d5c51b",
++                "bassboost" to "14804144-a5ee-4d24-aa88-0002a5d5c51b",
++                "dap" to "6ab06da4-c516-4611-8166-452799218539",
++                "dap_proxy" to "9d4921da-8225-4f29-aefa-39537a04bcaa",
++                "sa3d_proxy" to "1c91fca0-664a-11e4-b8c2-0002a5d5c51b",
++                "sa3d_sw" to "3462a6e0-655a-11e4-8b67-0002a5d5c51b",
++                "soundalive_proxy" to "05227ea0-50bb-11e3-ac69-0002a5d5c51b",
++                "soundalive_sw" to "cf65eb39-ce2f-48a8-a903-ceb818c06745",
++                "dha_proxy" to "37155c20-50bb-11e3-9fac-0002a5d5c51b",
++                "mysound_sw" to "263a88e0-50b1-11e2-bcfd-0800200c9a66",
++                "soundbooster" to "50de45f0-5d4c-11e5-a837-0800200c9a66",
++                "legacy_sa" to "c4da1d1f-7cdf-42e2-ba60-efc7eb3508a3",
++                "legacy_dap" to "46d279d9-9be7-453d-9d7c-ef937f675587",
++                "aosp_downmix" to "93f04452-e4fe-41cc-91f9-e475b6d1d69f",
++                "aosp_loudness" to "fa415329-2034-4bea-b5dc-5b381c8d1e2c",
++                "aosp_audiosphere" to "184e62ab-2d19-4364-9d1b-c0a40733866c",
++                "aosp_shoebox" to "1eab784c-1a36-4b2a-b7fc-e34c44cab89e",
++                "aosp_dynproc" to "e0e6539b-1781-7261-676f-6d7573696340",
++                "aosp_hw_acc" to "7d1580bd-297f-4683-9239-e475b6d1d69f",
++                "vr3d" to "e6388202-e7a4-4c72-b68a-332eeeba269b",
++                "music_helper" to "08b8b058-0590-11e5-ac71-0025b32654a0",
++                "ring_helper" to "0956df94-0590-11e5-bdbe-0025b32654a0",
++                "aec" to "0f8d0d2a-59e5-45fe-b6e4-248c8a799109",
++                "volume" to "119341a0-8469-11df-81f9-0002a5d5c51b")
++        for ((name, uuid) in types) {
++            run {
++                val effect = runCatching {
++                    AudioEffect(java.util.UUID.fromString(uuid), AudioEffect.EFFECT_TYPE_NULL,
++                            0, session)
++                }.getOrNull()
++                if (effect != null) {
++                    Log.i(TAG, "PROBE $name session=$session OK uuid=$uuid id=${effect.id}")
++                    runCatching { effect.enabled = true }
++                    runCatching { effect.release() }
++                } else {
++                    Log.i(TAG, "PROBE $name session=$session FALLO uuid=$uuid")
++                }
++            }
++        }
++    }
++
++    /** Tono de prueba: crea una sesion de audio real con MediaPlayer. */
++    private fun testPlay(context: Context) {
++        val dir = java.io.File("/product/media/audio/alarms")
++        val file = dir.listFiles()?.firstOrNull() ?: run {
++            Log.i(TAG, "TESTPLAY sin ficheros en $dir")
++            return
++        }
++        val player = android.media.MediaPlayer()
++        runCatching {
++            player.setDataSource(file.absolutePath)
++            player.isLooping = true
++            player.setVolume(0.4f, 0.4f)
++            player.prepare()
++            player.start()
++        }.onFailure { Log.i(TAG, "TESTPLAY fallo ${it.message}") }
++        Log.i(TAG, "TESTPLAY ${file.name} session=${player.audioSessionId}")
++    }
++
++    companion object {
++        private const val TAG = "SamsungDAP"
++        private const val ACTION_PROBE = "org.lineageos.dap.PROBE"
++        private const val ACTION_TESTPLAY = "org.lineageos.dap.TESTPLAY"
++    }
++}
+diff --git a/dap/src/org/lineageos/dap/EqualizerPreference.kt b/dap/src/org/lineageos/dap/EqualizerPreference.kt
+new file mode 100755
+index 0000000..3aa94ab
+--- /dev/null
++++ b/dap/src/org/lineageos/dap/EqualizerPreference.kt
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (C) 2022 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.lineageos.dap
++
++import android.content.Context
++import android.util.AttributeSet
++
++import androidx.preference.Preference
++import androidx.preference.PreferenceViewHolder
++
++/** Preferencia que hospeda el ecualizador de 9 bandas de [EqualizerView]. */
++class EqualizerPreference(context: Context, attrs: AttributeSet?) :
++        Preference(context, attrs) {
++
++    var onValuesChanged: ((IntArray) -> Unit)? = null
++
++    private var view: EqualizerView? = null
++    private var values = IntArray(SoundAliveCore.BANDS)
++    private var editable = true
++
++    init {
++        layoutResource = R.layout.preference_equalizer
++        isSelectable = false
++    }
++
++    fun setValues(levels: IntArray) {
++        values = IntArray(SoundAliveCore.BANDS) { levels.getOrElse(it) { 0 } }
++        view?.setLevels(values)
++    }
++
++    fun getValues(): IntArray = view?.getLevels() ?: values.copyOf()
++
++    fun setEditable(value: Boolean) {
++        editable = value
++        view?.setEditable(value)
++    }
++
++    override fun onBindViewHolder(holder: PreferenceViewHolder) {
++        super.onBindViewHolder(holder)
++        val equalizer = holder.itemView.findViewById<EqualizerView>(R.id.eq_view) ?: return
++        view = equalizer
++        equalizer.setLevels(values)
++        equalizer.setEditable(editable)
++        equalizer.onLevelsChanged = { levels ->
++            values = levels
++            onValuesChanged?.invoke(levels)
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/dap/src/org/lineageos/dap/EqualizerView.kt b/dap/src/org/lineageos/dap/EqualizerView.kt
+new file mode 100755
+index 0000000..7e33ab3
+--- /dev/null
++++ b/dap/src/org/lineageos/dap/EqualizerView.kt
+@@ -0,0 +1,183 @@
++/*
++ * Copyright (C) 2022 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.lineageos.dap
++
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.RectF
++import android.util.AttributeSet
++import android.view.MotionEvent
++import android.view.View
++
++/**
++ * Ecualizador grafico de 9 bandas dibujado a mano: barras verticales con la linea
++ * de 0 dB en el centro, valor en dB encima y frecuencia debajo.
++ *
++ * No se usan SeekBar rotados porque la rotacion no cambia los limites de layout y
++ * quedaban recortados.
++ */
++class EqualizerView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
++
++    var onLevelsChanged: ((IntArray) -> Unit)? = null
++
++    private val frequencies = intArrayOf(63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
++    private val levels = IntArray(SoundAliveCore.BANDS)
++
++    private val trackPaint = Paint().apply {
++        color = Color.parseColor("#33FFFFFF")
++        style = Paint.Style.FILL
++    }
++    private val filledPaint = Paint().apply {
++        color = Color.parseColor("#4DD0E1")
++        style = Paint.Style.FILL
++    }
++    private val zeroPaint = Paint().apply {
++        color = Color.parseColor("#66FFFFFF")
++        strokeWidth = 2f
++    }
++    private val thumbPaint = Paint().apply {
++        color = Color.parseColor("#4DD0E1")
++        style = Paint.Style.FILL
++    }
++    private val valuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        color = Color.WHITE
++        textAlign = Paint.Align.CENTER
++    }
++    private val freqPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        color = Color.parseColor("#99FFFFFF")
++        textAlign = Paint.Align.CENTER
++    }
++
++    private var activeBand = -1
++    private var editable = true
++
++    /** Con un preset fijo las barras se muestran pero no se pueden tocar. */
++    fun setEditable(value: Boolean) {
++        editable = value
++        alpha = if (value) 1f else 0.55f
++        invalidate()
++    }
++
++    fun setLevels(values: IntArray) {
++        for (band in 0 until SoundAliveCore.BANDS) {
++            levels[band] = values.getOrElse(band) { 0 }
++                    .coerceIn(SoundAliveCore.MIN_LEVEL, SoundAliveCore.MAX_LEVEL)
++        }
++        invalidate()
++    }
++
++    fun getLevels(): IntArray = levels.copyOf()
++
++    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
++        val width = MeasureSpec.getSize(widthMeasureSpec)
++        val height = (resources.displayMetrics.density * 260).toInt()
++        setMeasuredDimension(width, height)
++    }
++
++    override fun onDraw(canvas: Canvas) {
++        super.onDraw(canvas)
++
++        val valueSize = resources.displayMetrics.scaledDensity * 11f
++        val freqSize = resources.displayMetrics.scaledDensity * 10f
++        valuePaint.textSize = valueSize
++        freqPaint.textSize = freqSize
++
++        val paddingTop = valueSize * 1.6f
++        val paddingBottom = freqSize * 2.0f
++        val trackTop = paddingTop
++        val trackBottom = height - paddingBottom
++        val trackHeight = trackBottom - trackTop
++        if (trackHeight <= 0) return
++
++        val slot = width.toFloat() / SoundAliveCore.BANDS
++        val barWidth = slot * 0.42f
++        val radius = barWidth / 2f
++
++        val zeroY = trackTop + trackHeight / 2f
++        canvas.drawLine(0f, zeroY, width.toFloat(), zeroY, zeroPaint)
++
++        val range = SoundAliveCore.MAX_LEVEL - SoundAliveCore.MIN_LEVEL
++        for (band in 0 until SoundAliveCore.BANDS) {
++            val centerX = slot * band + slot / 2f
++            val left = centerX - barWidth / 2f
++
++            canvas.drawRoundRect(RectF(left, trackTop, left + barWidth, trackBottom),
++                    radius, radius, trackPaint)
++
++            val level = levels[band]
++            val fraction = (level - SoundAliveCore.MIN_LEVEL).toFloat() / range
++            val barTop = trackBottom - trackHeight * fraction
++            val from = minOf(barTop, zeroY)
++            val to = maxOf(barTop, zeroY)
++            if (to - from > 1f) {
++                canvas.drawRoundRect(RectF(left, from, left + barWidth, to), radius, radius,
++                        filledPaint)
++            }
++            canvas.drawCircle(centerX, barTop, barWidth * 0.62f, thumbPaint)
++
++            val text = if (level > 0) "+$level" else level.toString()
++            canvas.drawText(text, centerX, paddingTop - valueSize * 0.35f, valuePaint)
++            canvas.drawText(label(frequencies[band]), centerX, height - freqSize * 0.6f, freqPaint)
++        }
++    }
++
++    private fun label(hz: Int) = if (hz >= 1000) "${hz / 1000}k" else hz.toString()
++
++    override fun onTouchEvent(event: MotionEvent): Boolean {
++        if (!editable) return false
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN -> parent?.requestDisallowInterceptTouchEvent(true)
++            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
++                parent?.requestDisallowInterceptTouchEvent(false)
++        }
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
++                val slot = width.toFloat() / SoundAliveCore.BANDS
++                val band = (event.x / slot).toInt()
++                        .coerceIn(0, SoundAliveCore.BANDS - 1)
++                activeBand = band
++                updateBandFromY(band, event.y)
++                return true
++            }
++            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
++                activeBand = -1
++                return true
++            }
++        }
++        return super.onTouchEvent(event)
++    }
++
++    private fun updateBandFromY(band: Int, y: Float) {
++        val valueSize = resources.displayMetrics.scaledDensity * 11f
++        val freqSize = resources.displayMetrics.scaledDensity * 10f
++        val trackTop = valueSize * 1.6f
++        val trackBottom = height - freqSize * 2.0f
++        val trackHeight = trackBottom - trackTop
++        if (trackHeight <= 0) return
++
++        val fraction = ((trackBottom - y) / trackHeight).coerceIn(0f, 1f)
++        val range = SoundAliveCore.MAX_LEVEL - SoundAliveCore.MIN_LEVEL
++        val level = SoundAliveCore.MIN_LEVEL + Math.round(fraction * range)
++        if (level == levels[band]) return
++
++        levels[band] = level
++        invalidate()
++        onLevelsChanged?.invoke(levels.copyOf())
++    }
++}
+diff --git a/dap/src/org/lineageos/dap/SoundAliveCore.kt b/dap/src/org/lineageos/dap/SoundAliveCore.kt
+new file mode 100644
+index 0000000..6689b6a
+--- /dev/null
++++ b/dap/src/org/lineageos/dap/SoundAliveCore.kt
+@@ -0,0 +1,407 @@
++/*
++ * Copyright (C) 2022 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.lineageos.dap
++
++import android.media.audiofx.AudioEffect
++import android.util.Log
++
++import java.util.UUID
++
++/**
++ * Ecualizador de Samsung (libaudiosaplus_sec.so) sobre la sesion de audio de cada
++ * reproductor.
++ *
++ * Por que por sesion: un efecto creado en la sesion 0 no llega a los reproductores
++ * que abren la suya (Spotify usa la suya), y quedaba habilitado sin procesar nada.
++ *
++ * Controles que funcionan, comprobados en la tablet:
++ *
++ *   - 9 bandas:  id 2  setLevel(banda, nivel), param=[2, banda], value=[nivel]
++ *                bandas 0..8, nivel -12..+12 dB.
++ *   - flags:     id 14 setGlobalEffectInfo -> value=[SAPlus, TubeAmp, contentType].
++ *                Confirmado en logcat:
++ *                  "setGlobalEffectInfo changed ... mGlobalSAPlus = 1,
++ *                   mGlobalTubeAmp = 0, mGlobalConcertHall = 0"
++ *                ConcertHall va forzado a 0 dentro de ese manejador (por eso el
++ *                reverb no se puede activar por aqui; era lo que metia el eco).
++ *   - 3D:        efecto aparte (MySpace, TYPE b6c0ace0...), se crea por sesion.
++ *
++ * NO funciona: id 9 (setPreset) no cambia el sonido en este equipo, e id 10/11/13
++ * tampoco hacen nada medible. Por eso los perfiles de Samsung se reproducen con
++ * las 9 bandas usando sus curvas medidas con el propio motor (relativas al perfil
++ * Normal), que es la unica via que si suena.
++ *
++ * IMPORTANTE: setGlobalEffectInfo actua sobre el motor GLOBAL del proceso de audio.
++ *
++ * La curva del DSP del altavoz ([BASE]) va SIEMPRE aplicada cuando la salida es el
++ * altavoz: el interruptor maestro solo mete o quita el ecualizador de usuario
++ * encima, de modo que al apagarlo el sonido queda como la stock (curva del altavoz
++ * y nada mas) y no plano. Con cascos, USB o Bluetooth la curva no se manda ([AudioRoute]).
++ * La stock tambien funciona asi: SoundBooster es una etapa fija antes de SoundAlive.
++ */
++object SoundAliveCore {
++    // Nuestro efecto (hardware/samsung/dap/eq): la curva del altavoz va dentro
++    // de la libreria, aqui solo se mandan los ajustes del usuario.
++    private val EFFECT_TYPES_SA = listOf(
++            UUID.fromString("d1e0a001-7c00-4b00-9f00-000000000001"))
++
++    private fun createEffect(types: List<UUID>, sessionId: Int): AudioEffect? {
++        for (uuid in types) {
++            val effect = runCatching {
++                AudioEffect(uuid, AudioEffect.EFFECT_TYPE_NULL, 0, sessionId)
++            }.onFailure {
++                Log.w("SamsungDAP", "SoundAlive: $uuid no disponible en la sesion $sessionId", it)
++            }.getOrNull()
++            if (effect != null) {
++                Log.i("SamsungDAP", "SoundAlive: efecto $uuid en la sesion $sessionId")
++                return effect
++            }
++        }
++        return null
++    }
++
++    // Protocolo de libdapeq: 1 = bypass, 2 = pre-ganancia, 10+n = banda n y
++    // 20 = curva entera. Todo en centesimas de dB.
++    private const val PARAM_BYPASS = 1
++    private const val PARAM_PREGAIN = 2
++    private const val PARAM_BAND_FIRST = 10
++    private const val PARAM_CURVE = 20
++
++    const val BANDS = 9
++    const val MIN_LEVEL = -12
++    const val MAX_LEVEL = 12
++    private const val MAX_SESSIONS = 8
++
++    const val PRESET_CUSTOM = "custom"
++    const val PRESET_DEFAULT = "neutral"
++
++    /** Curva fija del DSP del altavoz de Samsung, base de todos los perfiles. */
++    val BASE = intArrayOf(1, 4, 3, -6, 1, -3, -12, -2, 4)
++
++    /**
++     * Perfiles, como ajuste en dB sobre [BASE] (bandas 63/125/250/500/1k/2k/4k/8k/16k).
++     *
++     * Los tres primeros son propios. Los cinco de Samsung reproducen las curvas
++     * medidas con el propio motor (presets 0..4), relativas al perfil Normal:
++     *   Pop      +8,1 dB @100 Hz | +4,0 @200 | -1,9 @1k | -4,8 @6k
++     *   Clasica  +9,4 @100 | +5,1 @200 | -2,0 @1k | -5,1 @6k
++     *   Jazz     +7,7 @100 | +2,3 @200 | -1,9 @1k | -9,3 @6k
++     *   Rock     +7,7 @100 | +2,3 @200 | -1,8 @1k | -9,4 @6k
++     */
++    val PRESETS: Map<String, IntArray> = linkedMapOf(
++            "neutral" to intArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0),
++            "bass" to intArrayOf(3, 5, 3, 0, 0, 0, 0, 0, 0),
++            "bass_max" to intArrayOf(6, 8, 5, 1, 0, 0, 0, 0, 0),
++            // Pop y Clasica: medidos del motor (casi identicos entre si, 1,3 dB).
++            "sa_pop" to intArrayOf(9, 8, 5, 1, -2, -3, -4, -5, -5),
++            "sa_classic" to intArrayOf(10, 9, 6, 2, -2, -3, -4, -5, -5),
++            // Jazz: medido del motor (caida progresiva de agudos).
++            "sa_jazz" to intArrayOf(8, 7, 3, 1, -2, -5, -8, -9, -9),
++            // Rock: el motor lo da practicamente igual que Jazz (0,1 dB de
++            // diferencia), asi que se usa la curva en V clasica del rock para que
++            // los perfiles se distingan: graves y agudos arriba, medios atras.
++            "sa_rock" to intArrayOf(10, 7, 2, -1, -2, 0, 2, 3, 2),
++    )
++
++    val PRESET_NAMES: List<String> = PRESETS.keys.toList() + PRESET_CUSTOM
++
++    private const val GLOBAL_SESSION = 0
++
++    private val sessions = LinkedHashSet<Int>()
++    private val effects = LinkedHashMap<Int, AudioEffect>()
++    private val surroundEffects = LinkedHashMap<Int, AudioEffect>()
++
++    private var enabled = true
++    private var surround = false
++    private var tubeAmp = false
++    private var preset = PRESET_DEFAULT
++    private var offsets = IntArray(BANDS)
++    // La curva del altavoz solo se manda cuando la salida es el altavoz.
++    private var speakerRoute = true
++    // Dispositivo de salida activo: Bluetooth por MAC, USB por nombre, etc.
++    private var deviceKey = AudioRoute.KEY_SPEAKER
++
++    @Synchronized
++    fun addSession(sessionId: Int) {
++        if (sessionId <= 0) return
++        if (!sessions.contains(sessionId) && sessions.size >= MAX_SESSIONS) {
++            val oldest = sessions.first()
++            sessions.remove(oldest)
++            releaseSession(oldest)
++        }
++        sessions.add(sessionId)
++        // En el altavoz la curva de la stock va siempre, este encendido o apagado
++        // el interruptor. Fuera del altavoz solo se crea si el usuario ha puesto
++        // una curva que no sea neutra.
++        if (eqNeeded()) createFor(sessionId)
++        if (enabled && surround) createSurround(sessionId)
++    }
++
++    @Synchronized
++    fun removeSession(sessionId: Int) {
++        sessions.remove(sessionId)
++        releaseSession(sessionId)
++    }
++
++    /**
++     * El interruptor solo mete o quita el ecualizador del usuario (y el 3D). En el
++     * altavoz la curva de la stock sigue puesta siempre, sin tocarse; fuera del
++     * altavoz apagar el interruptor (o quedarse en Neutro) suelta el efecto.
++     */
++    @Synchronized
++    fun setEnabled(value: Boolean) {
++        enabled = value
++        // Se reaplica siempre, cambie o no el valor: el motor puede haber perdido
++        // el estado (patch recreado, cambio de ruta) y hay que dejarlo coherente.
++        refreshEffects()
++    }
++
++    @Synchronized
++    fun isEnabled() = enabled
++
++    @Synchronized
++    fun currentPreset() = preset
++
++    @Synchronized
++    fun isCustom() = preset == PRESET_CUSTOM
++
++    @Synchronized
++    fun getOffsets(): IntArray = offsets.copyOf()
++
++    @Synchronized
++    fun effectiveLevels(): IntArray = IntArray(BANDS) { band ->
++        // La curva del altavoz va siempre de base y los perfiles del usuario se
++        // suman encima. (Se intento mover la base a un device effect del XML, pero
++        // esta ROM no puede: el patch del altavoz al arrancar es HW y
++        // DeviceEffectProxy no puede enganchar efectos a un patch HW.)
++        val base = if (speakerRoute) BASE[band] else 0
++        (base + if (enabled) offsets[band] else 0).coerceIn(MIN_LEVEL, MAX_LEVEL)
++    }
++
++    /**
++     * Cambio de salida de audio.
++     *
++     * En el altavoz el efecto tiene que estar vivo siempre para que suene la curva
++     * de la stock, con el interruptor encendido o apagado. Fuera del altavoz, si el
++     * interruptor esta apagado o el perfil es Neutro no debe quedar ningun efecto
++     * (ni curva ni EQ); si hay una curva de usuario solo se manda esa (base = 0).
++     */
++    @Synchronized
++    fun setRoute(isSpeaker: Boolean, key: String) {
++        val routeChanged = speakerRoute != isSpeaker
++        val deviceChanged = deviceKey != key
++        speakerRoute = isSpeaker
++        deviceKey = key
++        if (!routeChanged && !deviceChanged) return
++        refreshEffects()
++    }
++
++    @Synchronized
++    fun isSpeakerRoute() = speakerRoute
++
++    @Synchronized
++    fun setPreset(name: String) {
++        if (!PRESET_NAMES.contains(name)) return
++        preset = name
++        PRESETS[name]?.let { offsets = it.copyOf() }
++        // Fuera del altavoz, Neutro no procesa nada: se suelta el efecto. Si ya
++        // existe, createFor sale antes y solo se reenvian las bandas.
++        ensureEq()
++        // Solo cambian las bandas: no hace falta reenviar los parametros globales
++        // (id 14 reconfigura el motor entero y metia un corte en cada cambio).
++        sendBands()
++    }
++
++    /** Cambia el nombre del perfil sin reaplicar nada (ecualizador manual). */
++    @Synchronized
++    fun setPresetName(name: String) {
++        if (PRESET_NAMES.contains(name)) preset = name
++    }
++
++    /**
++     * Rehace los efectos desde cero con el estado actual. Se usa al quitar Dolby:
++     * el DAP y SoundAlive comparten el proceso de audio, y recrear el efecto es la
++     * unica forma de garantizar que el motor no se queda con nada del estado
++     * anterior (equivale al "recrear el patch" de la stock).
++     */
++    @Synchronized
++    fun rebuild() {
++        effects.keys.toList().forEach { releaseEq(it) }
++        surroundEffects.keys.toList().forEach { releaseSurround(it) }
++        refreshEffects()
++    }
++
++    @Synchronized
++    fun setOffsets(values: IntArray) {
++        offsets = IntArray(BANDS) { band ->
++            values.getOrElse(band) { 0 }.coerceIn(MIN_LEVEL, MAX_LEVEL)
++        }
++        // Al mover una barra puede pasarse de Neutro a una curva (o al reves), y
++        // fuera del altavoz eso decide si el efecto tiene que existir.
++        ensureEq()
++        // Solo bandas: esto se llama en cada movimiento de una barra del ecualizador
++        // y reenviar los globales (id 14) reconfigura el motor y chasquea.
++        sendBands()
++    }
++
++    @Synchronized
++    fun setSurround(value: Boolean) {
++        if (surround == value) return
++        surround = value
++        if (value) {
++            if (!enabled) return
++            sessions.toList().forEach { createSurround(it) }
++        } else {
++            releaseSurroundAll()
++        }
++    }
++
++    @Synchronized
++    fun isSurround() = surround
++
++    @Synchronized
++    fun setTubeAmp(value: Boolean) {
++        if (tubeAmp == value) return
++        tubeAmp = value
++        applyAll()
++    }
++
++    @Synchronized
++    fun isTubeAmp() = tubeAmp
++
++    private fun applyAll() {
++        effects.values.forEach { apply(it) }
++    }
++
++    /**
++     * El efecto de SoundAlive solo existe en el altavoz: alli va siempre, para
++     * mandar la curva de la stock (con el interruptor encendido o apagado) y, si el
++     * usuario lo enciende, sumar su curva encima. Fuera del altavoz no se procesa
++     * nada: ni curva ni ecualizador (el DSP suena artificial en cascos).
++     */
++    // La curva base va SIEMPRE en el altavoz (con Dolby encendido o apagado); lo
++    // que manda el interruptor son los ajustes del usuario encima.
++    private fun eqNeeded(): Boolean = speakerRoute
++
++    /** Crea o suelta el efecto sin reaplicar parametros (cambio de perfil/bandas). */
++    private fun ensureEq() {
++        val needed = eqNeeded()
++        sessions.toList().forEach { if (needed) createFor(it) else releaseEq(it) }
++    }
++
++    /** Deja los efectos creados o sueltos segun la ruta y la curva, y aplica todo. */
++    private fun refreshEffects() {
++        // La sesion 0 es la salida global del dispositivo: se engancha siempre
++        // para que el motor se aplique aunque el reproductor no abra sesion
++        // (Spotify no manda OPEN_AUDIO_EFFECT_CONTROL_SESSION).
++        sessions.add(GLOBAL_SESSION)
++        val needed = eqNeeded()
++        sessions.toList().forEach { session ->
++            if (needed) createFor(session) else releaseEq(session)
++            if (enabled && surround) createSurround(session) else releaseSurround(session)
++        }
++        applyAll()
++    }
++
++    /**
++     * Suelta el 3D de todas las sesiones. MySpace es un motor global: si solo se
++     * hace release() sin desactivarlo antes, el motor sigue procesando y el 3D
++     * "no se quita" (seguia sonando aunque el interruptor estuviera apagado).
++     */
++    private fun releaseSurroundAll() {
++        surroundEffects.keys.toList().forEach { releaseSurround(it) }
++    }
++
++    private fun releaseSurround(sessionId: Int) {
++        surroundEffects.remove(sessionId)?.let { effect ->
++            runCatching { effect.enabled = false }
++            runCatching { effect.release() }
++        }
++    }
++
++    private fun sendBands() {
++        val levels = effectiveLevels()
++        effects.values.forEach { effect ->
++            runCatching {
++                for (band in 0 until BANDS) {
++                    effect.setParameter(ints(PARAM_BAND_FIRST + band), ints(levels[band] * 100))
++                }
++            }
++        }
++    }
++
++    private fun createFor(sessionId: Int) {
++        if (effects.containsKey(sessionId)) return
++        val effect = createEffect(EFFECT_TYPES_SA, sessionId) ?: return
++        effects[sessionId] = effect
++        apply(effect)
++    }
++
++    private fun createSurround(sessionId: Int) {
++        // libdapeq no hace 3D todavia: el surround se queda fuera.
++    }
++
++    private fun releaseSession(sessionId: Int) {
++        releaseEq(sessionId)
++        releaseSurround(sessionId)
++    }
++
++    /** Suelta solo el efecto de SoundAlive; el 3D es un motor aparte. */
++    private fun releaseEq(sessionId: Int) {
++        effects.remove(sessionId)?.let { effect ->
++            clearGlobals(effect)
++            runCatching { effect.release() }
++        }
++    }
++
++    private fun clearGlobals(effect: AudioEffect) {
++        runCatching {
++            effect.setParameter(ints(PARAM_BYPASS), ints(1))
++            effect.enabled = false
++        }
++    }
++
++    private fun apply(effect: AudioEffect) {
++        runCatching {
++            // La curva va entera de una vez: son 9 bandas y con el protocolo de
++            // Samsung hacia falta un setParameter por banda.
++            val levels = effectiveLevels()
++            effect.setParameter(ints(PARAM_CURVE), ints(*IntArray(BANDS) { levels[it] * 100 }))
++            effect.setParameter(ints(PARAM_PREGAIN), ints(pregainFor(levels) * 100))
++            effect.setParameter(ints(PARAM_BYPASS), ints(0))
++            effect.enabled = true
++        }
++    }
++
++    /**
++     * Sin atenuacion: la stock tampoco compensaba la curva, y meter -4 dB se
++     * notaba como volumen bajo. Si hay picos, el limitador del efecto los
++     * absorbe (trabaja en float y satura suave antes de que el HAL recorte).
++     */
++    private fun pregainFor(levels: IntArray): Int = 0
++
++    private fun ints(vararg values: Int): ByteArray {
++        val out = ByteArray(values.size * 4)
++        for (i in values.indices) {
++            out[i * 4] = (values[i] and 0xff).toByte()
++            out[i * 4 + 1] = ((values[i] shr 8) and 0xff).toByte()
++            out[i * 4 + 2] = ((values[i] shr 16) and 0xff).toByte()
++            out[i * 4 + 3] = ((values[i] shr 24) and 0xff).toByte()
++        }
++        return out
++    }
++}

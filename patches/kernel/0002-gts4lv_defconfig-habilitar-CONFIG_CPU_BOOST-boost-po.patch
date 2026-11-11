@@ -1,0 +1,31 @@
+From d243942ff4d061984b3bbf9774b92e09e2762a21 Mon Sep 17 00:00:00 2001
+From: xjosemi <xjosemi@localhost>
+Date: Wed, 4 Nov 2026 15:44:59 +0100
+Subject: [PATCH 2/2] gts4lv_defconfig: habilitar CONFIG_CPU_BOOST (boost por
+ eventos)
+
+Boost de frecuencia a corto plazo ante eventos de entrada y migraciones de hilos
+importantes: pensado para la respuesta de la UI en 4 GB, donde el limite medido es el
+hilo de UI (Slow UI thread=25) y no la GPU (9-14 ms por frame).
+
+Change-Id: Ic3cc832421bb49403aa13520bb03d1a6960913d5
+---
+ arch/arm64/configs/gts4lv_defconfig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/arch/arm64/configs/gts4lv_defconfig b/arch/arm64/configs/gts4lv_defconfig
+index 89fa7b577..15a2bdbb7 100644
+--- a/arch/arm64/configs/gts4lv_defconfig
++++ b/arch/arm64/configs/gts4lv_defconfig
+@@ -92,6 +92,8 @@ CONFIG_CPU_IDLE=y
+ CONFIG_CPU_FREQ=y
+ CONFIG_CPU_FREQ_STAT=y
+ CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y
++# CPU boost por eventos (toques, migraciones)
++CONFIG_CPU_BOOST=y
+ CONFIG_NET=y
+ CONFIG_PACKET=y
+ CONFIG_UNIX=y
+-- 
+2.43.0
+

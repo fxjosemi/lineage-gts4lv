@@ -1,0 +1,26 @@
+From 97fe3db664e633b8bbfbc5633713e5f7435f6897 Mon Sep 17 00:00:00 2001
+From: xjosemi <xjosemi@local>
+Date: Wed, 4 Nov 2026 23:40:43 +0100
+Subject: [PATCH] config: CONFIG_RCU_BOOST=y (como el Pixel 3a)
+
+Mejora la latencia de RCU para tareas de alta prioridad. Es lo que usa el
+kernel de CarbonROM para bonito/sargo (mismo SDM670, mismo 4.9).
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Change-Id: Ic963cd40aa02f30753362aa42893ea780313e6e9
+---
+ arch/arm64/configs/gts4lv_defconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/configs/gts4lv_defconfig b/arch/arm64/configs/gts4lv_defconfig
+index 15a2bdbb7..a420db08d 100644
+--- a/arch/arm64/configs/gts4lv_defconfig
++++ b/arch/arm64/configs/gts4lv_defconfig
+@@ -815,3 +815,4 @@ CONFIG_CRYPTO_AES_ARM64_CE_BLK=y
+ CONFIG_CRYPTO_CRC32_ARM64=y
+ CONFIG_XZ_DEC=y
+ CONFIG_QMI_ENCDEC=y
++CONFIG_RCU_BOOST=y
+-- 
+2.49.0
+
